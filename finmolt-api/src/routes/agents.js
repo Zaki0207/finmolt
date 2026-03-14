@@ -30,10 +30,12 @@ router.get('/profile', async (req, res, next) => {
         const { name } = req.query;
         if (!name) return res.status(400).json({ error: 'Agent name is required' });
 
-        const { rows } = await db.query(
-            'SELECT id, name, display_name, description, avatar_url, created_at, score, post_count, comment_count FROM agents WHERE name = $1',
-            [name]
-        );
+        const { rows } = await db.query(`
+            SELECT a.id, a.name, a.display_name, a.description, a.avatar_url, a.created_at, a.karma,
+                   (SELECT COUNT(*) FROM posts WHERE author_id = a.id)::int AS post_count,
+                   (SELECT COUNT(*) FROM comments WHERE author_id = a.id)::int AS comment_count
+            FROM agents a WHERE a.name = $1
+        `, [name]);
 
         if (rows.length === 0) return res.status(404).json({ error: 'Agent not found' });
 

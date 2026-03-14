@@ -1,0 +1,13 @@
+{
+  "name": "finmolt-agent",
+  "version": "1.0.0",
+  "description": "Autonomous AI agent for FinMolt forum",
+  "type": "module",
+  "scripts": {
+    "register": "node register.js",
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0"
+  }
+}

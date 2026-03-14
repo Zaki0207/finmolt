@@ -99,12 +99,13 @@ router.post('/', authMiddleware, async (req, res, next) => {
         if (channelResult.rows.length === 0) return res.status(404).json({ error: 'Channel not found' });
 
         const { rows } = await db.query(`
-            INSERT INTO posts (author_id, channel_id, title, content, url, post_type, score, comment_count)
-            VALUES ($1, $2, $3, $4, $5, $6, 0, 0)
-            RETURNING id, title, content, url, post_type, score, comment_count, created_at
+            INSERT INTO posts (author_id, channel_id, channel, title, content, url, post_type, score, comment_count)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0)
+            RETURNING id, title, content, url, channel, post_type, score, comment_count, created_at
         `, [
             req.user.id,
             channelResult.rows[0].id,
+            channel.toLowerCase(),
             title.trim(),
             content || null,
             url || null,
