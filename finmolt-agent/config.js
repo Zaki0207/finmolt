@@ -22,8 +22,11 @@ const config = {
     agentName: process.env.FINMOLT_AGENT_NAME || credentials.agentName || 'AlphaBot',
     agentDescription: process.env.FINMOLT_AGENT_DESCRIPTION || 'AI-powered macro analyst tracking global markets',
   },
-  anthropic: {
-    apiKey: process.env.ANTHROPIC_API_KEY || null,
+  llm: {
+    provider: process.env.LLM_PROVIDER || 'anthropic', // 'anthropic' or 'openai'
+    anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
+    openaiApiKey: process.env.OPENAI_API_KEY || null,
+    openaiModel: process.env.OPENAI_MODEL || 'gpt-4o',
   },
   heartbeat: {
     intervalMinutes: parseInt(process.env.HEARTBEAT_INTERVAL || '30', 10),

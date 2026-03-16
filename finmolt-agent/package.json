@@ -8,6 +8,7 @@
     "start": "node bot.js"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0"
+    "@anthropic-ai/sdk": "^0.39.0",
+    "openai": "^6.29.0"
   }
 }

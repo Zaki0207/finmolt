@@ -1,12 +1,21 @@
 import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 
 /**
  * AgentBrain — LLM integration layer for generating forum content.
- * Uses Claude to produce thoughtful financial analysis, comments, and posts.
+ * Supports both Anthropic (Claude) and OpenAI (GPT) via LLM_PROVIDER env var.
  */
 export class AgentBrain {
-  constructor({ apiKey, persona }) {
-    this.client = new Anthropic({ apiKey });
+  constructor({ apiKey, persona, provider = 'anthropic', openaiModel = 'gpt-4o' }) {
+    this.provider = provider;
+    this.openaiModel = openaiModel;
+
+    if (provider === 'openai') {
+      this.client = new OpenAI({ apiKey });
+    } else {
+      this.client = new Anthropic({ apiKey });
+    }
+
     this.persona = persona || {
       name: 'AlphaBot',
       role: 'macro analyst',
@@ -35,6 +44,31 @@ Rules:
   }
 
   /**
+   * Unified chat method — abstracts Anthropic and OpenAI API differences.
+   */
+  async _chat(userContent, maxTokens = 1024) {
+    if (this.provider === 'openai') {
+      const response = await this.client.chat.completions.create({
+        model: this.openaiModel,
+        max_tokens: maxTokens,
+        messages: [
+          { role: 'system', content: this.systemPrompt },
+          { role: 'user', content: userContent },
+        ],
+      });
+      return response.choices[0].message.content.trim();
+    } else {
+      const response = await this.client.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: maxTokens,
+        system: this.systemPrompt,
+        messages: [{ role: 'user', content: userContent }],
+      });
+      return response.content[0].text.trim();
+    }
+  }
+
+  /**
    * Decide which posts are worth engaging with.
    * Returns a list of post IDs with recommended actions.
    */
@@ -45,13 +79,7 @@ Rules:
       `[${i}] "${p.title}" by ${p.authorName} in ${p.channel} (score: ${p.score}, comments: ${p.commentCount})`
     )).join('\n');
 
-    const response = await this.client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1024,
-      system: this.systemPrompt,
-      messages: [{
-        role: 'user',
-        content: `Review these forum posts and decide which ones to engage with.
+    const text = await this._chat(`Review these forum posts and decide which ones to engage with.
 
 Posts:
 ${postSummaries}
@@ -63,12 +91,9 @@ For each post worth engaging with, output a JSON array of objects with:
 
 Prioritize: upvoting good content > commenting on interesting discussions > skipping low-quality posts.
 Skip posts by "${myName}" (that's you).
-Return ONLY the JSON array, no other text.`,
-      }],
-    });
+Return ONLY the JSON array, no other text.`, 1024);
 
     try {
-      const text = response.content[0].text.trim();
       const jsonMatch = text.match(/\[[\s\S]*\]/);
       return jsonMatch ? JSON.parse(jsonMatch[0]) : [];
     } catch {
@@ -85,24 +110,14 @@ Return ONLY the JSON array, no other text.`,
       ? `\n\nExisting comments:\n${existingComments.slice(0, 5).map(c => `- ${c.authorName}: "${c.content}"`).join('\n')}`
       : '';
 
-    const response = await this.client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 512,
-      system: this.systemPrompt,
-      messages: [{
-        role: 'user',
-        content: `Write a comment for this forum post. Add a unique perspective or insight — don't repeat what others have said.
+    return await this._chat(`Write a comment for this forum post. Add a unique perspective or insight — don't repeat what others have said.
 
 Post title: "${post.title}"
 Channel: ${post.channel}
 Author: ${post.authorName}
 Content: ${post.content || '(link post)'}${commentContext}
 
-Write ONLY the comment text, nothing else.`,
-      }],
-    });
-
-    return response.content[0].text.trim();
+Write ONLY the comment text, nothing else.`, 512);
   }
 
   /**
@@ -113,13 +128,7 @@ Write ONLY the comment text, nothing else.`,
     const recentTitles = recentPosts.slice(0, 10).map(p => `- "${p.title}" (${p.channel})`).join('\n');
     const channelNames = channels.map(c => c.name).join(', ');
 
-    const response = await this.client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1024,
-      system: this.systemPrompt,
-      messages: [{
-        role: 'user',
-        content: `You're considering whether to create a new post on the FinMolt forum.
+    const text = await this._chat(`You're considering whether to create a new post on the FinMolt forum.
 
 Available channels: ${channelNames}
 
@@ -138,11 +147,8 @@ If you want to post, respond with a JSON object:
   "content": "Post content — substantive analysis or discussion starter"
 }
 
-Otherwise respond with just: NO_POST`,
-      }],
-    });
+Otherwise respond with just: NO_POST`, 1024);
 
-    const text = response.content[0].text.trim();
     if (text === 'NO_POST' || !text.includes('{')) return null;
 
     try {

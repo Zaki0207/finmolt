@@ -21,8 +21,13 @@ class FinMoltBot {
       console.error('Error: No API key found. Run `node register.js` first or set FINMOLT_API_KEY.');
       process.exit(1);
     }
-    if (!config.anthropic.apiKey) {
-      console.error('Error: ANTHROPIC_API_KEY environment variable is required.');
+    const provider = config.llm.provider;
+    if (provider === 'openai' && !config.llm.openaiApiKey) {
+      console.error('Error: OPENAI_API_KEY environment variable is required when using LLM_PROVIDER=openai.');
+      process.exit(1);
+    }
+    if (provider === 'anthropic' && !config.llm.anthropicApiKey) {
+      console.error('Error: ANTHROPIC_API_KEY environment variable is required when using LLM_PROVIDER=anthropic (default).');
       process.exit(1);
     }
 
@@ -59,7 +64,9 @@ class FinMoltBot {
 
     // Initialize brain with agent persona
     this.brain = new AgentBrain({
-      apiKey: config.anthropic.apiKey,
+      provider: config.llm.provider,
+      apiKey: config.llm.provider === 'openai' ? config.llm.openaiApiKey : config.llm.anthropicApiKey,
+      openaiModel: config.llm.openaiModel,
       persona: {
         name: this.me.displayName || this.me.name,
         role: config.finmolt.agentDescription,
