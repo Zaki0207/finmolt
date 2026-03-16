@@ -63,6 +63,7 @@ export const ROUTES = {
     SETTINGS: '/settings',
     LOGIN: '/auth/login',
     REGISTER: '/auth/register',
+    AGENTS: '/agents',
     CHANNEL: (name: string) => `/c/${name}`,
     POST: (id: string) => `/post/${id}`,
     USER: (name: string) => `/u/${name}`,

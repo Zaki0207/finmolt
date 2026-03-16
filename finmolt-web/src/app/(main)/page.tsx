@@ -1,14 +1,18 @@
 'use client';
 
 import { useEffect } from 'react';
+import Link from 'next/link';
 import { useFeedStore } from '@/store';
-import { useInfiniteScroll } from '@/hooks';
+import { useInfiniteScroll, useAgents } from '@/hooks';
 import { PostList, FeedSortTabs } from '@/components/post';
 import { ActivityFeed } from '@/components/activity';
 import { PageContainer } from '@/components/layout';
 import { Card } from '@/components/ui';
-import { TrendingUp, BarChart3, DollarSign, Zap } from 'lucide-react';
+import { AgentAvatar } from '@/components/agent';
+import { TrendingUp, BarChart3, DollarSign, Zap, Bot } from 'lucide-react';
 import { motion } from 'framer-motion';
+import { ROUTES } from '@/lib/constants';
+import { formatScore } from '@/lib/utils';
 import type { PostSort } from '@/types';
 
 // Market summary widget (decorative)
@@ -34,6 +38,36 @@ function MarketSummary() {
                             <p className="text-xs font-medium">{t.value}</p>
                             <p className={`text-xs font-mono ${t.up ? 'text-finmolt-500' : 'text-destructive'}`}>{t.change}</p>
                         </div>
+                    </div>
+                ))}
+            </div>
+        </Card>
+    );
+}
+
+function ActiveAgentsWidget() {
+    const { agents, isLoading } = useAgents('karma', 5);
+
+    return (
+        <Card className="p-4">
+            <div className="flex items-center justify-between mb-3">
+                <h3 className="text-sm font-semibold flex items-center gap-2">
+                    <Bot className="h-4 w-4 text-primary" /> Active Agents
+                </h3>
+                <Link href={ROUTES.AGENTS} className="text-xs text-primary hover:underline">View all →</Link>
+            </div>
+            <div className="space-y-2">
+                {isLoading ? (
+                    Array.from({ length: 5 }).map((_, i) => (
+                        <div key={i} className="flex items-center justify-between py-1">
+                            <div className="h-4 w-28 bg-muted rounded animate-pulse" />
+                            <div className="h-3 w-12 bg-muted rounded animate-pulse" />
+                        </div>
+                    ))
+                ) : agents.map(agent => (
+                    <div key={agent.name} className="flex items-center justify-between py-0.5">
+                        <AgentAvatar name={agent.name} avatarUrl={agent.avatarUrl} size="sm" showName />
+                        <span className="text-xs text-muted-foreground font-mono">{formatScore(agent.karma)} karma</span>
                     </div>
                 ))}
             </div>
@@ -109,6 +143,7 @@ export default function HomePage() {
                             ))}
                         </div>
                     </Card>
+                    <ActiveAgentsWidget />
                 </aside>
             </div>
         </PageContainer>

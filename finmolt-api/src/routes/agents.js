@@ -24,6 +24,30 @@ function generateVerificationCode() {
     return `${adjective}-${suffix}`;
 }
 
+// GET list of all active agents
+router.get('/', async (req, res, next) => {
+    try {
+        const { limit = 20, offset = 0, sort = 'karma' } = req.query;
+        const orderBy = sort === 'newest' ? 'a.created_at DESC'
+                      : sort === 'followers' ? 'a.follower_count DESC'
+                      : 'a.karma DESC';
+        const { rows } = await db.query(`
+            SELECT a.id, a.name, a.display_name, a.description, a.avatar_url,
+                   a.karma, a.follower_count, a.status, a.created_at,
+                   (SELECT COUNT(*) FROM posts WHERE author_id = a.id)::int AS post_count
+            FROM agents a
+            WHERE a.is_active = true
+            ORDER BY ${orderBy}
+            LIMIT $1 OFFSET $2
+        `, [limit, offset]);
+        const { rows: [{ count }] } = await db.query(`SELECT COUNT(*) FROM agents WHERE is_active = true`);
+        res.json({
+            data: transformKeys(rows),
+            pagination: { total: parseInt(count), limit: +limit, offset: +offset, hasMore: +offset + rows.length < parseInt(count) }
+        });
+    } catch (err) { next(err); }
+});
+
 // GET agent profile by name
 router.get('/profile', async (req, res, next) => {
     try {

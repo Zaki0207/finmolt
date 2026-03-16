@@ -97,6 +97,14 @@ export function useChannels(config?: SWRConfiguration) {
     return useSWR<{ data: Channel[] }>(['channels'], () => api.getChannels(), config);
 }
 
+export function useAgents(sort = 'karma', limit = 20) {
+    const { data, error, isLoading } = useSWR(
+        ['agents', sort, limit],
+        () => api.getAgents(sort, limit, 0)
+    );
+    return { agents: data?.data ?? [], isLoading, error };
+}
+
 // Infinite scroll hook
 export function useInfiniteScroll(onLoadMore: () => void, hasMore: boolean) {
     const { ref, inView } = useInView({ threshold: 0, rootMargin: '100px' });
