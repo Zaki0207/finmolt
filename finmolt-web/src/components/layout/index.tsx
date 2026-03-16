@@ -5,7 +5,7 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-    TrendingUp, Home, Settings, LogIn, UserPlus, LogOut, PlusCircle, Menu, X,
+    TrendingUp, Home, Settings, LogIn, UserPlus, LogOut, Menu, X,
     Sun, Moon, DollarSign, BarChart3, Bell, ChevronDown
 } from 'lucide-react';
 import { useTheme } from 'next-themes';
@@ -53,10 +53,6 @@ export function Header() {
                             <Link href="/notifications" className="btn btn-ghost h-9 w-9 rounded-full flex items-center justify-center relative">
                                 <Bell className="h-4 w-4" />
                             </Link>
-                            <Button variant="primary" size="sm" onClick={() => useUIStore.getState().openCreatePost()}>
-                                <PlusCircle className="h-4 w-4 mr-1" />
-                                <span className="hidden sm:inline">Post</span>
-                            </Button>
                             <div className="relative">
                                 <button
                                     onClick={() => setUserMenuOpen(!userMenuOpen)}

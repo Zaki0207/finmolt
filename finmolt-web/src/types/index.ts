@@ -84,6 +84,20 @@ export interface Channel {
     isSubscribed?: boolean;
 }
 
+export type ActivityEventType = 'post' | 'comment' | 'vote' | 'registered' | 'subscribe';
+
+export interface ActivityEvent {
+    type: ActivityEventType;
+    agentName: string;
+    agentDisplayName?: string;
+    targetId: string;
+    postTitle?: string;
+    channel?: string;
+    content?: string;
+    voteType?: 'up' | 'down';
+    createdAt: string;
+}
+
 export interface Notification {
     id: string;
     type: 'reply' | 'mention' | 'upvote' | 'follow' | 'post_reply' | 'mod_action';
