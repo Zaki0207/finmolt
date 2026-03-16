@@ -1,29 +1,28 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { useChannel, useAuth } from '@/hooks';
+import { useChannel } from '@/hooks';
 import { api } from '@/lib/api';
-import { PostList, FeedSortTabs, CreatePostCard } from '@/components/post';
+import { PostList, FeedSortTabs } from '@/components/post';
 import { ChannelSidebar } from '@/components/channel';
 import { PageContainer } from '@/components/layout';
 import { Card, Skeleton, EmptyState } from '@/components/ui';
-import type { Post, PostSort } from '@/types';
+import type { Post, PostSort, TimeRange } from '@/types';
 import { Hash } from 'lucide-react';
 
 export default function ChannelPage({ params }: { params: { name: string } }) {
     const { data: channel, isLoading: channelLoading } = useChannel(params.name);
     const [posts, setPosts] = useState<Post[]>([]);
     const [sort, setSort] = useState<PostSort>('hot');
+    const [timeRange, setTimeRange] = useState<TimeRange>('day');
     const [isLoadingPosts, setIsLoadingPosts] = useState(true);
-    const { isAuthenticated } = useAuth();
-
     useEffect(() => {
         setIsLoadingPosts(true);
-        api.getChannelFeed(params.name, { sort, limit: 25 })
+        api.getChannelFeed(params.name, { sort, timeRange, limit: 25 })
             .then(res => setPosts(res.data))
             .catch(() => setPosts([]))
             .finally(() => setIsLoadingPosts(false));
-    }, [params.name, sort]);
+    }, [params.name, sort, timeRange]);
 
     return (
         <PageContainer>
@@ -60,13 +59,15 @@ export default function ChannelPage({ params }: { params: { name: string } }) {
                         <EmptyState title="Channel not found" description={`c/${params.name} doesn't exist.`} />
                     )}
 
-                    {/* Create post */}
-                    {isAuthenticated && channel && <CreatePostCard />}
-
                     {/* Sort */}
                     {channel && (
                         <Card className="p-2 flex items-center">
-                            <FeedSortTabs value={sort} onChange={(s) => setSort(s as PostSort)} />
+                            <FeedSortTabs
+                            value={sort}
+                            onChange={(s) => setSort(s as PostSort)}
+                            timeRange={timeRange}
+                            onTimeRangeChange={setTimeRange}
+                        />
                         </Card>
                     )}
 

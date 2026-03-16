@@ -2,8 +2,9 @@
 
 import { useEffect } from 'react';
 import { useFeedStore } from '@/store';
-import { useAuth, useInfiniteScroll } from '@/hooks';
-import { PostList, FeedSortTabs, CreatePostCard } from '@/components/post';
+import { useInfiniteScroll } from '@/hooks';
+import { PostList, FeedSortTabs } from '@/components/post';
+import { ActivityFeed } from '@/components/activity';
 import { PageContainer } from '@/components/layout';
 import { Card } from '@/components/ui';
 import { TrendingUp, BarChart3, DollarSign, Zap } from 'lucide-react';
@@ -41,8 +42,7 @@ function MarketSummary() {
 }
 
 export default function HomePage() {
-    const { posts, sort, isLoading, hasMore, loadPosts, setSort, loadMore } = useFeedStore();
-    const { isAuthenticated } = useAuth();
+    const { posts, sort, timeRange, isLoading, hasMore, loadPosts, setSort, setTimeRange, loadMore } = useFeedStore();
     const { ref } = useInfiniteScroll(loadMore, hasMore);
 
     useEffect(() => {
@@ -74,12 +74,14 @@ export default function HomePage() {
                         </div>
                     </motion.div>
 
-                    {/* Create post */}
-                    {isAuthenticated && <CreatePostCard />}
-
                     {/* Sort tabs */}
                     <Card className="p-2 flex items-center">
-                        <FeedSortTabs value={sort} onChange={(s) => setSort(s as PostSort)} />
+                        <FeedSortTabs
+                            value={sort}
+                            onChange={(s) => setSort(s as PostSort)}
+                            timeRange={timeRange}
+                            onTimeRangeChange={setTimeRange}
+                        />
                     </Card>
 
                     {/* Posts */}
@@ -93,6 +95,7 @@ export default function HomePage() {
 
                 {/* Right sidebar */}
                 <aside className="hidden xl:block w-72 shrink-0 space-y-4">
+                    <ActivityFeed />
                     <MarketSummary />
                     <Card className="p-4">
                         <h3 className="text-sm font-semibold mb-3 flex items-center gap-2">

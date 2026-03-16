@@ -10,7 +10,8 @@ import { usePostVote, useAuth } from '@/hooks';
 import { useUIStore } from '@/store';
 import { Card, Skeleton, Avatar, Button } from '@/components/ui';
 import type { Post, PostSort } from '@/types';
-import { SORT_OPTIONS } from '@/lib/constants';
+import { SORT_OPTIONS, TIME_RANGES } from '@/lib/constants';
+import type { TimeRange } from '@/types';
 
 // Vote Buttons
 function VoteButtons({ postId, score, userVote }: { postId: string; score: number; userVote?: 'up' | 'down' | null }) {
@@ -152,9 +153,19 @@ export function PostList({ posts, isLoading }: { posts: Post[]; isLoading: boole
 }
 
 // Feed Sort Tabs
-export function FeedSortTabs({ value, onChange }: { value: PostSort; onChange: (sort: string) => void }) {
+export function FeedSortTabs({
+    value,
+    onChange,
+    timeRange,
+    onTimeRangeChange,
+}: {
+    value: PostSort;
+    onChange: (sort: string) => void;
+    timeRange?: TimeRange;
+    onTimeRangeChange?: (range: TimeRange) => void;
+}) {
     return (
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1 flex-wrap">
             {SORT_OPTIONS.POSTS.map(option => (
                 <button
                     key={option.value}
@@ -170,6 +181,25 @@ export function FeedSortTabs({ value, onChange }: { value: PostSort; onChange: (
                     {option.label}
                 </button>
             ))}
+            {value === 'top' && onTimeRangeChange && (
+                <>
+                    <span className="text-muted-foreground/40 mx-1">|</span>
+                    {TIME_RANGES.map(range => (
+                        <button
+                            key={range.value}
+                            onClick={() => onTimeRangeChange(range.value as TimeRange)}
+                            className={cn(
+                                'px-2.5 py-1 rounded-full text-xs font-medium transition-colors',
+                                timeRange === range.value
+                                    ? 'bg-primary/10 text-primary'
+                                    : 'text-muted-foreground hover:bg-accent hover:text-foreground'
+                            )}
+                        >
+                            {range.label}
+                        </button>
+                    ))}
+                </>
+            )}
         </div>
     );
 }

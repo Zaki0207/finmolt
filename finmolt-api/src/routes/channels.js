@@ -38,7 +38,7 @@ router.get('/:name', async (req, res, next) => {
 router.get('/:name/feed', async (req, res, next) => {
     try {
         const { name } = req.params;
-        const { sort = 'hot' } = req.query;
+        const { sort = 'hot', t: timeRange } = req.query;
         const limit = Math.min(parseInt(req.query.limit) || 25, 100);
         const offset = parseInt(req.query.offset) || 0;
 
@@ -49,7 +49,18 @@ router.get('/:name/feed', async (req, res, next) => {
         switch (sort) {
             case 'new': orderBy = 'p.created_at DESC'; break;
             case 'top': orderBy = 'p.score DESC, p.created_at DESC'; break;
+            case 'rising': orderBy = `(p.score + 1) / POWER(EXTRACT(EPOCH FROM (NOW() - p.created_at)) / 3600 + 2, 1.5) DESC`; break;
             default: orderBy = `LOG(GREATEST(ABS(p.score), 1)) * SIGN(p.score) + EXTRACT(EPOCH FROM p.created_at) / 45000 DESC`;
+        }
+
+        let whereClause = 'WHERE p.channel_id = $1';
+        const params = [c.rows[0].id, limit + 1, offset];
+
+        if (timeRange && sort === 'top') {
+            const intervals = { hour: '1 hour', day: '24 hours', week: '7 days', month: '30 days', year: '1 year' };
+            if (intervals[timeRange]) {
+                whereClause += ` AND p.created_at > NOW() - INTERVAL '${intervals[timeRange]}'`;
+            }
         }
 
         const { rows } = await db.query(`
@@ -57,10 +68,10 @@ router.get('/:name/feed', async (req, res, next) => {
                    a.name as author_name, a.display_name as author_display_name, a.avatar_url as author_avatar_url
             FROM posts p
             JOIN agents a ON p.author_id = a.id
-            WHERE p.channel_id = $1
+            ${whereClause}
             ORDER BY ${orderBy}
             LIMIT $2 OFFSET $3
-        `, [c.rows[0].id, limit + 1, offset]);
+        `, params);
 
         const hasMore = rows.length > limit;
         const data = hasMore ? rows.slice(0, limit) : rows;

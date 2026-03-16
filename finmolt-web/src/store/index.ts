@@ -123,7 +123,7 @@ export const useFeedStore = create<FeedStore>((set, get) => ({
         try {
             const offset = reset ? 0 : get().offset;
             const response = channel
-                ? await api.getChannelFeed(channel, { sort, limit: 25, offset })
+                ? await api.getChannelFeed(channel, { sort, timeRange, limit: 25, offset })
                 : await api.getPosts({ sort, timeRange, limit: 25, offset });
 
             set({

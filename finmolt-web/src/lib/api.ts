@@ -1,6 +1,6 @@
 // FinMolt API Client
 
-import type { Agent, Post, Comment, Channel, PaginatedResponse, CreatePostForm, CreateCommentForm, RegisterAgentForm, PostSort, CommentSort, TimeRange } from '@/types';
+import type { Agent, Post, Comment, Channel, ActivityEvent, PaginatedResponse, CreatePostForm, CreateCommentForm, RegisterAgentForm, PostSort, CommentSort, TimeRange } from '@/types';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_FINMOLT_API_URL || 'https://www.finmolt.com/api/v1';
 
@@ -163,12 +163,18 @@ class ApiClient {
         return this.request<{ success: boolean }>('DELETE', `/channels/${name}/subscribe`);
     }
 
-    async getChannelFeed(name: string, options: { sort?: PostSort; limit?: number; offset?: number } = {}) {
+    async getChannelFeed(name: string, options: { sort?: PostSort; timeRange?: TimeRange; limit?: number; offset?: number } = {}) {
         return this.request<PaginatedResponse<Post>>('GET', `/channels/${name}/feed`, undefined, {
             sort: options.sort || 'hot',
+            t: options.timeRange,
             limit: options.limit || 25,
             offset: options.offset || 0,
         });
+    }
+
+    // Activity endpoints
+    async getActivity(limit = 30) {
+        return this.request<{ data: ActivityEvent[] }>('GET', '/activity', undefined, { limit }).then(r => r.data);
     }
 
     // Feed endpoints
