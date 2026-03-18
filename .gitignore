@@ -1,13 +1,3 @@
-# 只保留 finmolt-api/ 和 finmolt-web/
-api/
-auth/
-comments/
-feed/
-moltbook-frontend/
-moltbook-web-client-application/
-rate-limiter/
-voting/
-
 # 环境变量（敏感）
 finmolt-api/.env
 finmolt-web/.env.local
