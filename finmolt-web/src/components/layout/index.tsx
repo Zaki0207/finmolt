@@ -6,7 +6,7 @@ import { usePathname } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
     TrendingUp, Home, Settings, LogIn, UserPlus, LogOut, Menu, X,
-    Sun, Moon, DollarSign, BarChart3, Bell, ChevronDown
+    Sun, Moon, DollarSign, BarChart3, Bell, ChevronDown, Globe
 } from 'lucide-react';
 import { useTheme } from 'next-themes';
 import { useAuth } from '@/hooks';
@@ -117,6 +117,7 @@ export function Sidebar() {
         { href: '/', label: 'Home', icon: Home },
         { href: '/trending', label: 'Trending', icon: TrendingUp },
         { href: '/markets', label: 'Markets', icon: BarChart3 },
+        { href: '/polymarket', label: 'Prediction Markets', icon: Globe },
     ];
 
     return (
@@ -209,6 +210,9 @@ export function MobileMenu() {
                             </Link>
                             <Link href="/trending" className={cn('flex items-center gap-3 px-3 py-2 rounded-md text-sm font-medium', pathname === '/trending' ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:bg-accent')} onClick={toggleMobileMenu}>
                                 <TrendingUp className="h-4 w-4" /> Trending
+                            </Link>
+                            <Link href="/polymarket" className={cn('flex items-center gap-3 px-3 py-2 rounded-md text-sm font-medium', pathname === '/polymarket' ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:bg-accent')} onClick={toggleMobileMenu}>
+                                <Globe className="h-4 w-4" /> Prediction Markets
                             </Link>
                         </nav>
 

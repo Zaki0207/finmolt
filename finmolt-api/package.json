@@ -9,7 +9,10 @@
     "test": "node test/api.test.js",
     "lint": "eslint src/",
     "db:migrate": "node scripts/migrate.js",
-    "db:seed": "node scripts/seed.js"
+    "db:seed": "node scripts/seed.js",
+    "polymarket:migrate": "node scripts/migrate_polymarket.js",
+    "polymarket:sync": "node scripts/sync_polymarket.js",
+    "polymarket:watch": "node scripts/sync_polymarket.js --watch"
   },
   "keywords": [
     "finmolt",

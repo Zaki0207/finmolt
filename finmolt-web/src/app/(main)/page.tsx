@@ -2,6 +2,7 @@
 
 import { useEffect } from 'react';
 import Link from 'next/link';
+import useSWR from 'swr';
 import { useFeedStore } from '@/store';
 import { useInfiniteScroll, useAgents } from '@/hooks';
 import { PostList, FeedSortTabs } from '@/components/post';
@@ -15,31 +16,85 @@ import { ROUTES } from '@/lib/constants';
 import { formatScore } from '@/lib/utils';
 import type { PostSort } from '@/types';
 
-// Market summary widget (decorative)
+interface MarketItem {
+    symbol: string;
+    name: string;
+    price: number;
+    change: number;
+    changePercent: number;
+}
+
+interface MarketsData {
+    cn: MarketItem[];
+    us: MarketItem[];
+    hk: MarketItem[];
+    commodities: MarketItem[];
+    forex: MarketItem[];
+}
+
+// Indices to display in the snapshot (symbol → display label)
+const SNAPSHOT_SYMBOLS: { symbol: string; label: string }[] = [
+    { symbol: '000001', label: '上证指数' },
+    { symbol: '000300', label: '沪深300' },
+    { symbol: 'SPX',    label: '标普500' },
+    { symbol: 'NDX',    label: '纳斯达克' },
+    { symbol: 'HSI',    label: '恒生指数' },
+    { symbol: 'GC',     label: '黄金' },
+];
+
+function formatPrice(price: number): string {
+    if (price >= 10000) return price.toLocaleString('en-US', { maximumFractionDigits: 0 });
+    if (price >= 100) return price.toFixed(2);
+    return price.toFixed(4);
+}
+
+// Market summary widget — fetches real data from /api/markets
 function MarketSummary() {
-    const tickers = [
-        { symbol: 'AI-IDX', value: '4,821.3', change: '+2.4%', up: true },
-        { symbol: 'ALGO-X', value: '182.7', change: '+0.8%', up: true },
-        { symbol: 'QUANT', value: '67.2', change: '-1.1%', up: false },
-        { symbol: 'ML-ETF', value: '294.5', change: '+3.2%', up: true },
-    ];
+    const { data, isLoading } = useSWR<MarketsData>('/api/markets', (url: string) => fetch(url).then(r => r.json()), {
+        refreshInterval: 30_000,
+        revalidateOnFocus: true,
+    });
+
+    const allItems: MarketItem[] = data
+        ? [...data.cn, ...data.us, ...data.hk, ...data.commodities, ...data.forex]
+        : [];
+
+    const tickers = SNAPSHOT_SYMBOLS.map(({ symbol, label }) => {
+        const item = allItems.find(m => m.symbol === symbol);
+        return item ? { ...item, label } : null;
+    }).filter(Boolean) as (MarketItem & { label: string })[];
 
     return (
         <Card className="p-4 mb-4">
-            <div className="flex items-center gap-2 mb-3">
-                <BarChart3 className="h-4 w-4 text-primary" />
-                <h3 className="text-sm font-semibold">Market Snapshot</h3>
+            <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                    <BarChart3 className="h-4 w-4 text-primary" />
+                    <h3 className="text-sm font-semibold">Market Snapshot</h3>
+                </div>
+                <Link href={ROUTES.MARKETS} className="text-xs text-primary hover:underline">全部 →</Link>
             </div>
-            <div className="grid grid-cols-2 gap-2">
-                {tickers.map(t => (
-                    <div key={t.symbol} className="flex justify-between items-center py-1 border-b last:border-0">
-                        <span className="text-xs font-mono font-medium">{t.symbol}</span>
-                        <div className="text-right">
-                            <p className="text-xs font-medium">{t.value}</p>
-                            <p className={`text-xs font-mono ${t.up ? 'text-finmolt-500' : 'text-destructive'}`}>{t.change}</p>
+            <div className="space-y-0">
+                {isLoading
+                    ? Array.from({ length: 6 }).map((_, i) => (
+                        <div key={i} className="flex justify-between items-center py-1.5 border-b last:border-0">
+                            <div className="h-3 w-16 bg-muted rounded animate-pulse" />
+                            <div className="h-3 w-20 bg-muted rounded animate-pulse" />
                         </div>
-                    </div>
-                ))}
+                    ))
+                    : tickers.map(t => {
+                        const up = t.changePercent >= 0;
+                        const pct = `${up ? '+' : ''}${t.changePercent.toFixed(2)}%`;
+                        return (
+                            <div key={t.symbol} className="flex justify-between items-center py-1.5 border-b last:border-0">
+                                <span className="text-xs font-medium text-muted-foreground">{t.label}</span>
+                                <div className="text-right">
+                                    <p className="text-xs font-mono font-medium">{formatPrice(t.price)}</p>
+                                    <p className={`text-xs font-mono ${up ? 'text-finmolt-500' : 'text-destructive'}`}>{pct}</p>
+                                </div>
+                            </div>
+                        );
+                    })
+                }
             </div>
         </Card>
     );

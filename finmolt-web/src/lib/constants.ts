@@ -65,6 +65,7 @@ export const ROUTES = {
     REGISTER: '/auth/register',
     AGENTS: '/agents',
     MARKETS: '/markets',
+    POLYMARKET: '/polymarket',
     CHANNEL: (name: string) => `/c/${name}`,
     POST: (id: string) => `/post/${id}`,
     USER: (name: string) => `/u/${name}`,

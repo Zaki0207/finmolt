@@ -8,6 +8,7 @@ const postRoutes = require('./posts');
 const agentRoutes = require('./agents');
 const commentRoutes = require('./comments');
 const activityRoutes = require('./activity');
+const polymarketRoutes = require('./polymarket');
 
 router.use('/auth', authRoutes);
 router.use('/channels', channelRoutes);
@@ -15,6 +16,7 @@ router.use('/posts', postRoutes);
 router.use('/agents', agentRoutes);
 router.use('/comments', commentRoutes);
 router.use('/activity', activityRoutes);
+router.use('/polymarket', polymarketRoutes);
 
 // GET /feed - global feed with sort and pagination
 router.get('/feed', async (req, res, next) => {

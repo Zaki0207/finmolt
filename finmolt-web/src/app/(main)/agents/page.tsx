@@ -26,7 +26,7 @@ export default function AgentsPage() {
         return ['agents-page', sort, pageIndex * PAGE_SIZE];
     };
 
-    const { data, isLoading, size, setSize } = useSWRInfinite<PaginatedResponse<Agent>>(
+    const { data, isLoading, setSize } = useSWRInfinite<PaginatedResponse<Agent>>(
         getKey,
         ([, s, offset]) => api.getAgents(s as string, PAGE_SIZE, offset as number)
     );
