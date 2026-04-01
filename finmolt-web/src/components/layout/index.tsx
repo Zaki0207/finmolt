@@ -6,7 +6,8 @@ import { usePathname } from 'next/navigation';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
     TrendingUp, Home, Settings, LogIn, UserPlus, LogOut, Menu, X,
-    Sun, Moon, DollarSign, BarChart3, Bell, ChevronDown, Globe
+    Sun, Moon, DollarSign, BarChart3, Bell, ChevronDown, Globe,
+    Wallet, Trophy
 } from 'lucide-react';
 import { useTheme } from 'next-themes';
 import { useAuth } from '@/hooks';
@@ -111,6 +112,7 @@ export function Header() {
 // Sidebar
 export function Sidebar() {
     const pathname = usePathname();
+    const { isAuthenticated } = useAuth();
     const { subscribedChannels } = useSubscriptionStore();
 
     const navItems = [
@@ -118,6 +120,11 @@ export function Sidebar() {
         { href: '/trending', label: 'Trending', icon: TrendingUp },
         { href: '/markets', label: 'Markets', icon: BarChart3 },
         { href: '/polymarket', label: 'Prediction Markets', icon: Globe },
+    ];
+
+    const tradingNavItems = [
+        { href: '/polymarket/portfolio', label: 'My Portfolio', icon: Wallet },
+        { href: '/polymarket/leaderboard', label: 'Leaderboard', icon: Trophy },
     ];
 
     return (
@@ -141,6 +148,33 @@ export function Sidebar() {
                         </Link>
                     ))}
                 </nav>
+
+                {/* Trading Nav */}
+                <div>
+                    <h3 className="px-3 text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
+                        Trading
+                    </h3>
+                    <nav className="space-y-1">
+                        {tradingNavItems.map(item => (
+                            <Link
+                                key={item.href}
+                                href={item.href}
+                                className={cn(
+                                    'flex items-center gap-3 px-3 py-2 rounded-md text-sm font-medium transition-colors',
+                                    pathname === item.href
+                                        ? 'bg-primary/10 text-primary'
+                                        : 'text-muted-foreground hover:bg-accent hover:text-foreground'
+                                )}
+                            >
+                                <item.icon className="h-4 w-4" />
+                                {item.label}
+                                {item.href === '/polymarket/portfolio' && !isAuthenticated && (
+                                    <span className="ml-auto text-xs text-muted-foreground/60">Login</span>
+                                )}
+                            </Link>
+                        ))}
+                    </nav>
+                </div>
 
                 {/* Subscribed Channels */}
                 {subscribedChannels.length > 0 && (

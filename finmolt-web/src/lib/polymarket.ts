@@ -23,6 +23,13 @@ export interface PolymarketMarket {
     startDate?: string;  // ISO datetime
     endDate?: string;    // ISO datetime
     closedTime?: string; // ISO datetime, only present when market is closed
+    // CLOB price fields
+    clobTokenIds?: string[];
+    bestBid?: number | null;
+    bestAsk?: number | null;
+    lastPrice?: number | null;
+    priceUpdatedAt?: string | null;
+    volume?: number | null;
 }
 
 export interface PolymarketEvent {
@@ -51,6 +58,23 @@ export interface Pagination {
 export interface PolymarketEventsResponse {
     data: PolymarketEvent[];
     pagination: Pagination;
+}
+
+export interface PriceHistoryPoint {
+    t: number; // Unix timestamp (seconds)
+    p: number; // Price 0–1
+}
+
+export type PriceHistoryInterval = '1h' | '6h' | '1d' | '1w' | '1m' | 'max';
+
+export async function fetchMarketPriceHistory(
+    marketId: string,
+    interval: PriceHistoryInterval = '1w'
+): Promise<PriceHistoryPoint[]> {
+    const res = await fetch(`/api/polymarket/markets/${marketId}/prices-history?interval=${interval}`);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data.history) ? data.history : [];
 }
 
 export interface FetchEventsParams {
@@ -97,6 +121,36 @@ export function parseOutcomes(outcomes: string): string[] {
     } catch {
         return [];
     }
+}
+
+/**
+ * Returns true when the order book is liquid enough to use for execution prices.
+ * Spread >= 0.9 indicates an empty/illiquid book (e.g. negRisk outcome tokens
+ * with ask=1.0, bid=0 sitting as placeholder orders).
+ */
+export function isOrderBookLiquid(market: Pick<PolymarketMarket, 'bestBid' | 'bestAsk'>): boolean {
+    const { bestBid, bestAsk } = market;
+    if (bestBid == null || bestAsk == null) return false;
+    return (bestAsk - bestBid) < 0.9;
+}
+
+/**
+ * Calculates the probability price for a market.
+ * Rules:
+ * - Use mid-price (bestBid + bestAsk) / 2 if the spread is <= $0.10
+ * - Fall back to lastPrice otherwise (or if order book is empty)
+ */
+export function getMarketProbabilityPrice(market: Pick<PolymarketMarket, 'bestBid' | 'bestAsk' | 'lastPrice'>): number | null {
+    const { bestBid, bestAsk, lastPrice } = market;
+    if (bestBid != null && bestAsk != null) {
+        const spread = bestAsk - bestBid;
+        // Spread >= 0.9 means the order book is empty (e.g. ask=1.0, bid=0 for
+        // illiquid negRisk outcome tokens). Fall through to lastPrice in that case.
+        if (spread <= 0.10) {
+            return (bestBid + bestAsk) / 2;
+        }
+    }
+    return lastPrice ?? null;
 }
 
 /** Strip HTML tags and decode common HTML entities */

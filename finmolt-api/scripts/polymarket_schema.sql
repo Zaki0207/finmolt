@@ -68,13 +68,19 @@ ALTER TABLE polymarket_events
   ADD COLUMN IF NOT EXISTS search_vector TSVECTOR;
 
 ALTER TABLE polymarket_markets
-  ADD COLUMN IF NOT EXISTS image         TEXT,
-  ADD COLUMN IF NOT EXISTS description   TEXT,
-  ADD COLUMN IF NOT EXISTS neg_risk      BOOLEAN NOT NULL DEFAULT false,
-  ADD COLUMN IF NOT EXISTS start_date    TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS end_date      TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS closed_time   TIMESTAMPTZ,
-  ADD COLUMN IF NOT EXISTS search_vector TSVECTOR;
+  ADD COLUMN IF NOT EXISTS image            TEXT,
+  ADD COLUMN IF NOT EXISTS description      TEXT,
+  ADD COLUMN IF NOT EXISTS neg_risk         BOOLEAN NOT NULL DEFAULT false,
+  ADD COLUMN IF NOT EXISTS start_date       TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS end_date         TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS closed_time      TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS search_vector    TSVECTOR,
+  ADD COLUMN IF NOT EXISTS clob_token_ids   JSONB NOT NULL DEFAULT '[]',
+  ADD COLUMN IF NOT EXISTS best_bid         NUMERIC(10, 6),
+  ADD COLUMN IF NOT EXISTS best_ask         NUMERIC(10, 6),
+  ADD COLUMN IF NOT EXISTS last_price       NUMERIC(10, 6),
+  ADD COLUMN IF NOT EXISTS price_updated_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS volume           NUMERIC(20, 2);
 
 -- ─── Indexes ─────────────────────────────────────────────────────────────────
 

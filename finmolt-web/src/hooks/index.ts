@@ -1,9 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import useSWR, { SWRConfiguration } from 'swr';
+import useSWR, { SWRConfiguration, useSWRConfig } from 'swr';
 import { useInView } from 'react-intersection-observer';
 import { api } from '@/lib/api';
 import { useAuthStore, useFeedStore } from '@/store';
 import type { Post, Comment, Agent, Channel, PostSort, CommentSort } from '@/types';
+import type { AgentPortfolio, TradesResponse, LeaderboardResponse, MarketPositionsResponse } from '@/lib/trading';
+import { fetchMarketPriceHistory } from '@/lib/polymarket';
+import type { PriceHistoryPoint, PriceHistoryInterval } from '@/lib/polymarket';
 
 // Auth hooks
 export function useAuth() {
@@ -245,4 +248,105 @@ export function usePrevious<T>(value: T): T | undefined {
     const ref = useRef<T>();
     useEffect(() => { ref.current = value; });
     return ref.current;
+}
+
+// ── Trading hooks ─────────────────────────────────────────────────────────────
+
+/** Fetches the authenticated agent's portfolio. Refreshes every 30s. */
+export function usePortfolio(config?: SWRConfiguration) {
+    const { isAuthenticated, apiKey } = useAuth();
+    return useSWR<AgentPortfolio>(
+        isAuthenticated ? ['trading-portfolio', apiKey] : null,
+        () => api.getPortfolio(),
+        { refreshInterval: 30_000, ...config }
+    );
+}
+
+/** Fetches paginated trade history for the authenticated agent. */
+export function usePortfolioTrades(limit = 20, offset = 0, config?: SWRConfiguration) {
+    const { isAuthenticated, apiKey } = useAuth();
+    return useSWR<TradesResponse>(
+        isAuthenticated ? ['trading-trades', apiKey, limit, offset] : null,
+        () => api.getPortfolioTrades(limit, offset),
+        { revalidateOnFocus: false, ...config }
+    );
+}
+
+/** Fetches the public leaderboard. Refreshes every 60s. */
+export function useLeaderboard(config?: SWRConfiguration) {
+    return useSWR<LeaderboardResponse>(
+        'trading-leaderboard',
+        () => api.getLeaderboard(),
+        { refreshInterval: 60_000, ...config }
+    );
+}
+
+/** Fetches all agent positions for a given market. */
+export function useMarketPositions(marketId: string | null, config?: SWRConfiguration) {
+    return useSWR<MarketPositionsResponse>(
+        marketId ? ['trading-market-positions', marketId] : null,
+        () => api.getMarketPositions(marketId!),
+        { refreshInterval: 30_000, ...config }
+    );
+}
+
+/** Fetches price history for a single market. */
+export function usePriceHistory(
+    marketId: string | null,
+    interval: PriceHistoryInterval = '1w',
+    config?: SWRConfiguration
+) {
+    return useSWR<PriceHistoryPoint[]>(
+        marketId ? ['price-history', marketId, interval] : null,
+        () => fetchMarketPriceHistory(marketId!, interval),
+        { revalidateOnFocus: false, ...config }
+    );
+}
+
+/** Fetches price history for multiple markets in parallel. Returns array of histories in same order. */
+export function useMultiPriceHistory(
+    marketIds: string[],
+    interval: PriceHistoryInterval = '1w',
+    config?: SWRConfiguration
+) {
+    const key = marketIds.length > 0 ? ['price-history-multi', interval, ...marketIds] : null;
+    return useSWR<PriceHistoryPoint[][]>(
+        key,
+        async () => Promise.all(marketIds.map(id => fetchMarketPriceHistory(id, interval))),
+        { revalidateOnFocus: false, refreshInterval: 120_000, ...config }
+    );
+}
+
+/** Executes buy or sell trades, then refreshes the portfolio cache. */
+export function useTrade() {
+    const { mutate } = useSWRConfig();
+    const [isTrading, setIsTrading] = useState(false);
+    const [tradeError, setTradeError] = useState<string | null>(null);
+
+    const trade = useCallback(async (
+        side: 'buy' | 'sell',
+        marketId: string,
+        outcomeIdx: number,
+        shares: number
+    ) => {
+        setIsTrading(true);
+        setTradeError(null);
+        try {
+            const result = side === 'buy'
+                ? await api.buyShares(marketId, outcomeIdx, shares)
+                : await api.sellShares(marketId, outcomeIdx, shares);
+            // Invalidate portfolio and market positions caches
+            mutate((key) => Array.isArray(key) && key[0] === 'trading-portfolio');
+            mutate((key) => Array.isArray(key) && key[0] === 'trading-market-positions' && key[1] === marketId);
+            return result;
+        } catch (err: unknown) {
+            const message = err instanceof Error ? err.message : 'Trade failed';
+            setTradeError(message);
+            throw err;
+        } finally {
+            setIsTrading(false);
+        }
+    }, [mutate]);
+
+    return { trade, isTrading, tradeError, clearError: () => setTradeError(null) };
 }

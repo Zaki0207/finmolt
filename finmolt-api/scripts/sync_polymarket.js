@@ -106,7 +106,13 @@ function buildBatchUpsert(table, cols, rows, updateCols, conflictTarget) {
         values.push(...row);
     }
 
-    const updateSet = updateCols.map(c => `${c} = EXCLUDED.${c}`).join(', ');
+    const updateSet = updateCols.map(c =>
+        // Use COALESCE so a null from EXCLUDED never overwrites an existing value.
+        // This prevents sync_polymarket from wiping prices written by sync_prices.
+        c === 'last_price' || c === 'price_updated_at' || c === 'best_bid' || c === 'best_ask'
+            ? `${c} = COALESCE(EXCLUDED.${c}, ${c})`
+            : `${c} = EXCLUDED.${c}`
+    ).join(', ');
     const onConflict = updateCols.length > 0
         ? `ON CONFLICT ${conflictTarget} DO UPDATE SET ${updateSet}`
         : `ON CONFLICT ${conflictTarget} DO NOTHING`;
@@ -149,41 +155,79 @@ async function batchUpsertEvents(client, events) {
     }
 }
 
+/**
+ * Extract YES outcome price from the gamma API market object.
+ * The gamma API returns outcomePrices as a JSON string like '["0.54","0.46"]'
+ * or already as an array. Index 0 = YES token price (≈ best_ask).
+ */
+function extractYesPrice(m) {
+    try {
+        // negRisk multi-outcome markets: Gamma API always returns outcomePrices=["0.5","0.5"]
+        // as a placeholder. The real per-outcome prices come from the CLOB price history,
+        // not from this field. Skip to avoid overwriting correct prices.
+        if (m.negRisk) return null;
+
+        const raw = m.outcomePrices;
+        if (!raw) return null;
+        const arr = Array.isArray(raw) ? raw : JSON.parse(raw);
+        const price = parseFloat(arr[0]);
+        if (!isFinite(price)) return null;
+        // 0.5 is Polymarket's default placeholder for markets with no real trades.
+        // Only accept it if bestAsk or bestBid confirm there's a real order book.
+        if (price === 0.5 && m.bestAsk == null && m.bestBid == null) return null;
+        return price;
+    } catch {
+        return null;
+    }
+}
+
 async function batchUpsertMarkets(client, allMarkets) {
     const cols = [
         'id', 'event_id', 'question', 'slug', 'description', 'image',
-        'outcomes', 'group_item_title', 'neg_risk',
+        'outcomes', 'clob_token_ids', 'group_item_title', 'neg_risk',
         'active', 'closed', 'resolved_outcome',
         'start_date', 'end_date', 'closed_time', 'fetched_at',
+        'best_bid', 'best_ask', 'last_price', 'price_updated_at', 'volume',
     ];
     const updateCols = [
         'question', 'slug', 'description', 'image',
-        'outcomes', 'group_item_title', 'neg_risk',
+        'outcomes', 'clob_token_ids', 'group_item_title', 'neg_risk',
         'active', 'closed', 'resolved_outcome',
         'start_date', 'end_date', 'closed_time', 'fetched_at',
+        'best_bid', 'best_ask', 'last_price', 'price_updated_at', 'volume',
     ];
     const now = new Date();
 
     for (let i = 0; i < allMarkets.length; i += BATCH_SIZE) {
         const batch = allMarkets.slice(i, i + BATCH_SIZE);
-        const rows = batch.map(m => [
-            m.id,
-            m._eventId,
-            m.question,
-            m.slug || null,
-            m.description || null,
-            m.image || null,
-            JSON.stringify(parseOutcomes(m.outcomes)),
-            m.groupItemTitle || null,
-            !!m.negRisk,
-            m.active,
-            m.closed,
-            m.resolvedOutcome || null,
-            m.startDate || null,
-            m.endDate || null,
-            m.closedTime || null,
-            now,
-        ]);
+        const rows = batch.map(m => {
+            const yesPrice = extractYesPrice(m);
+            return [
+                m.id,
+                m._eventId,
+                m.question,
+                m.slug || null,
+                m.description || null,
+                m.image || null,
+                JSON.stringify(parseOutcomes(m.outcomes)),
+                JSON.stringify(parseOutcomes(m.clobTokenIds)),
+                m.groupItemTitle || null,
+                !!m.negRisk,
+                m.active,
+                m.closed,
+                m.resolvedOutcome || null,
+                m.startDate || null,
+                m.endDate || null,
+                m.closedTime || null,
+                now,
+                // negRisk: Gamma returns placeholder 0.5/0.5 — null out so CLOB sync owns these
+                m.negRisk ? null : (m.bestBid != null ? parseFloat(m.bestBid) : null),
+                m.negRisk ? null : (m.bestAsk != null ? parseFloat(m.bestAsk) : null),
+                yesPrice,
+                (m.bestBid != null || m.bestAsk != null || yesPrice !== null) ? now : null,
+                m.volume   != null ? parseFloat(m.volume)   : null,
+            ];
+        });
         const q = buildBatchUpsert('polymarket_markets', cols, rows, updateCols, '(id)');
         await client.query(q.text, q.values);
     }

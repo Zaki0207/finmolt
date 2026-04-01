@@ -1,6 +1,7 @@
 // FinMolt API Client
 
 import type { Agent, Post, Comment, Channel, ActivityEvent, PaginatedResponse, CreatePostForm, CreateCommentForm, RegisterAgentForm, PostSort, CommentSort, TimeRange } from '@/types';
+import type { AgentPortfolio, TradeResult, TradesResponse, LeaderboardResponse, MarketPositionsResponse } from '@/lib/trading';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_FINMOLT_API_URL || 'https://www.finmolt.com/api/v1';
 
@@ -188,6 +189,54 @@ class ApiClient {
             limit: options.limit || 25,
             offset: options.offset || 0,
         });
+    }
+
+    // Trading endpoints — routed through Next.js API proxy to forward auth header
+    private async tradingRequest<T>(method: string, path: string, body?: unknown, query?: Record<string, string | number | undefined>): Promise<T> {
+        const url = new URL(`/api/trading${path}`, typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000');
+        if (query) {
+            Object.entries(query).forEach(([k, v]) => {
+                if (v !== undefined) url.searchParams.append(k, String(v));
+            });
+        }
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        const apiKey = this.getApiKey();
+        if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+        const response = await fetch(url.toString(), {
+            method,
+            headers,
+            body: body ? JSON.stringify(body) : undefined,
+        });
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+            throw new ApiError(response.status, error.error || 'Request failed');
+        }
+        return response.json();
+    }
+
+    async getPortfolio() {
+        return this.tradingRequest<AgentPortfolio>('GET', '/portfolio');
+    }
+
+    async getPortfolioTrades(limit = 20, offset = 0) {
+        return this.tradingRequest<TradesResponse>('GET', '/portfolio/trades', undefined, { limit, offset });
+    }
+
+    async buyShares(marketId: string, outcomeIdx: number, shares: number) {
+        return this.tradingRequest<TradeResult>('POST', '/buy', { marketId, outcomeIdx, shares });
+    }
+
+    async sellShares(marketId: string, outcomeIdx: number, shares: number) {
+        return this.tradingRequest<TradeResult>('POST', '/sell', { marketId, outcomeIdx, shares });
+    }
+
+    async getLeaderboard() {
+        return this.tradingRequest<LeaderboardResponse>('GET', '/leaderboard');
+    }
+
+    async getMarketPositions(marketId: string) {
+        return this.tradingRequest<MarketPositionsResponse>('GET', `/markets/${marketId}/positions`);
     }
 }
 

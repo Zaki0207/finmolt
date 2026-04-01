@@ -20,6 +20,13 @@ function formatMarket(m) {
         startDate: m.start_date,
         endDate: m.end_date,
         closedTime: m.closed_time,
+        // CLOB price fields
+        clobTokenIds:   m.clob_token_ids   || [],
+        bestBid:        m.best_bid         != null ? parseFloat(m.best_bid)        : null,
+        bestAsk:        m.best_ask         != null ? parseFloat(m.best_ask)        : null,
+        lastPrice:      m.last_price       != null ? parseFloat(m.last_price)      : null,
+        priceUpdatedAt: m.price_updated_at || null,
+        volume:         m.volume          != null ? parseFloat(m.volume)          : null,
     };
 }
 
@@ -104,7 +111,8 @@ router.get('/events', async (req, res, next) => {
         const eventIds = data.map(e => e.id);
         const { rows: markets } = await db.query(`
             SELECT id, event_id, question, slug, description, image,
-                   outcomes::text AS outcomes,
+                   outcomes::text AS outcomes, clob_token_ids,
+                   best_bid, best_ask, last_price, price_updated_at, volume,
                    group_item_title, neg_risk, active, closed, resolved_outcome,
                    start_date, end_date, closed_time
             FROM polymarket_markets
@@ -162,7 +170,8 @@ router.get('/events/:slug', async (req, res, next) => {
         // Fetch markets
         const { rows: markets } = await db.query(`
             SELECT id, event_id, question, slug, description, image,
-                   outcomes::text AS outcomes,
+                   outcomes::text AS outcomes, clob_token_ids,
+                   best_bid, best_ask, last_price, price_updated_at, volume,
                    group_item_title, neg_risk, active, closed, resolved_outcome,
                    start_date, end_date, closed_time
             FROM polymarket_markets
@@ -180,6 +189,37 @@ router.get('/events/:slug', async (req, res, next) => {
 
         event._tags = tagRows;
         res.json(formatEvent(event, markets.map(formatMarket)));
+    } catch (err) { next(err); }
+});
+
+// ── GET /polymarket/markets/:marketId/prices-history ─────────────────────────
+
+const VALID_INTERVALS = new Set(['1h', '6h', '1d', '1w', '1m', 'max']);
+const FIDELITY_MAP = { '1h': 1, '6h': 5, '1d': 10, '1w': 60, '1m': 240, 'max': 1440 };
+
+router.get('/markets/:marketId/prices-history', async (req, res, next) => {
+    try {
+        const { marketId } = req.params;
+        const interval = VALID_INTERVALS.has(req.query.interval) ? req.query.interval : '1w';
+        const fidelity = FIDELITY_MAP[interval];
+
+        const { rows } = await db.query(
+            'SELECT clob_token_ids FROM polymarket_markets WHERE id = $1',
+            [marketId]
+        );
+        if (rows.length === 0) return res.status(404).json({ error: 'Market not found' });
+
+        const tokenIds = rows[0].clob_token_ids;
+        if (!tokenIds || !tokenIds.length) return res.json({ history: [] });
+
+        const tokenId = tokenIds[0];
+        const clobUrl = `https://clob.polymarket.com/prices-history?market=${encodeURIComponent(tokenId)}&interval=${interval}&fidelity=${fidelity}`;
+
+        const clobRes = await fetch(clobUrl, { signal: AbortSignal.timeout(10_000) });
+        if (!clobRes.ok) return res.json({ history: [] });
+
+        const data = await clobRes.json();
+        res.json({ history: data.history || [] });
     } catch (err) { next(err); }
 });
 

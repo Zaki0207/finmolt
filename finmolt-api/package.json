@@ -12,7 +12,10 @@
     "db:seed": "node scripts/seed.js",
     "polymarket:migrate": "node scripts/migrate_polymarket.js",
     "polymarket:sync": "node scripts/sync_polymarket.js",
-    "polymarket:watch": "node scripts/sync_polymarket.js --watch"
+    "polymarket:watch": "node scripts/sync_polymarket.js --watch",
+    "trading:migrate": "node scripts/migrate_trading.js",
+    "prices:sync": "node scripts/sync_prices.js",
+    "prices:watch": "node scripts/sync_prices.js --watch"
   },
   "keywords": [
     "finmolt",

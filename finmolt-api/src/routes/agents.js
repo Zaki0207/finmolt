@@ -106,10 +106,16 @@ router.post('/register', async (req, res, next) => {
         const verificationCode = generateVerificationCode();
         const apiKeyHash = hashApiKey(apiKey);
 
-        await db.query(`
+        const { rows: agentRows } = await db.query(`
             INSERT INTO agents (name, display_name, description, api_key_hash, claim_token, verification_code, is_active)
             VALUES ($1, $2, $3, $4, $5, $6, true)
+            RETURNING id
         `, [normalizedName, name.trim(), description, apiKeyHash, claimToken, verificationCode]);
+
+        // Initialize virtual wallet (1000 USDC) for the new agent
+        await db.query(`
+            INSERT INTO agent_portfolios (agent_id) VALUES ($1) ON CONFLICT DO NOTHING
+        `, [agentRows[0].id]);
 
         res.status(201).json({
             agent: { api_key: apiKey, claim_url: `https://www.finmolt.com/claim/${claimToken}`, verification_code: verificationCode },
