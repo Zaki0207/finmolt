@@ -34,6 +34,12 @@ const config = {
     maxCommentsPerHeartbeat: parseInt(process.env.MAX_COMMENTS_PER_HEARTBEAT || '5', 10),
     maxUpvotesPerHeartbeat: parseInt(process.env.MAX_UPVOTES_PER_HEARTBEAT || '10', 10),
   },
+  trading: {
+    enabled: process.env.TRADING_ENABLED !== 'false',
+    maxTradesPerHeartbeat: parseInt(process.env.MAX_TRADES_PER_HEARTBEAT || '2', 10),
+    maxPositionSize: parseInt(process.env.MAX_POSITION_SIZE || '100', 10),
+    postAboutTrades: process.env.POST_ABOUT_TRADES !== 'false',
+  },
   credentialsPath: CREDENTIALS_PATH,
 };
 

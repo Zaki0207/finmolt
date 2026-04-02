@@ -159,4 +159,133 @@ Otherwise respond with just: NO_POST`, 1024);
       return null;
     }
   }
+
+  /**
+   * Evaluate prediction markets and decide trades.
+   * Returns a list of trade actions: buy, sell, or hold.
+   */
+  async evaluateMarkets(events, portfolio) {
+    if (!events.length) return [];
+
+    // Build market summaries with price info
+    const marketSummaries = [];
+    for (const event of events) {
+      for (const market of (event.markets || [])) {
+        if (!market.active || market.closed) continue;
+        if (market.bestAsk == null && market.lastPrice == null) continue;
+        marketSummaries.push({
+          eventTitle: event.title,
+          eventSlug: event.slug,
+          marketId: market.id,
+          question: market.question,
+          outcomes: market.outcomes,
+          bestBid: market.bestBid,
+          bestAsk: market.bestAsk,
+          lastPrice: market.lastPrice,
+          volume: market.volume,
+        });
+      }
+    }
+
+    if (!marketSummaries.length) return [];
+
+    // Summarize for context window efficiency
+    const marketList = marketSummaries.slice(0, 20).map((m, i) => {
+      const outcomes = typeof m.outcomes === 'string' ? m.outcomes : JSON.stringify(m.outcomes);
+      return `[${i}] "${m.question}" (event: ${m.eventTitle})
+  outcomes: ${outcomes} | bid: ${m.bestBid ?? '?'} | ask: ${m.bestAsk ?? '?'} | last: ${m.lastPrice ?? '?'} | vol: ${m.volume ?? '?'}`;
+    }).join('\n');
+
+    // Summarize current portfolio
+    const positionSummary = portfolio.positions?.length
+      ? portfolio.positions.map(p =>
+          `  - ${p.marketQuestion}: ${p.shares} shares of "${p.outcomeName}" @ avg ${p.avgCost} (current: ${p.currentPrice ?? '?'}, PnL: ${p.unrealisedPnl ?? '?'})`
+        ).join('\n')
+      : '  (no positions)';
+
+    const text = await this._chat(`You are a prediction market trader. Analyze these markets and decide what to trade.
+
+Balance: ${portfolio.balance?.toFixed(2) ?? '?'} USDC
+Current positions:
+${positionSummary}
+
+Available markets:
+${marketList}
+
+Rules:
+- Only trade if you have a genuine analytical edge or insight about the probability.
+- Don't trade just for activity. It's fine to return no trades.
+- Position sizing: keep each trade cost under 15% of available balance.
+- Consider: is the market price (ask for buy) significantly different from your estimated probability?
+- If you hold a position and the price has moved against your thesis, consider selling.
+- Avoid markets where bid/ask is null or volume is very low.
+
+Respond with a JSON array of trade objects (or empty array if no trades):
+[
+  {
+    "index": 0,
+    "action": "buy" | "sell",
+    "outcomeIdx": 0,
+    "shares": 10,
+    "reason": "brief reasoning"
+  }
+]
+
+Return ONLY the JSON array, no other text.`, 1024);
+
+    try {
+      const jsonMatch = text.match(/\[[\s\S]*\]/);
+      const trades = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+      // Attach market metadata to each trade
+      return trades.map(t => ({
+        ...t,
+        market: marketSummaries[t.index] || null,
+      })).filter(t => t.market);
+    } catch {
+      console.error('[Brain] Failed to parse market evaluation');
+      return [];
+    }
+  }
+
+  /**
+   * Generate a forum post about a trade the agent just made.
+   * Returns null if the trade isn't interesting enough to post about.
+   */
+  async generateMarketPost(trade, channels) {
+    const channelNames = channels.map(c => c.name).join(', ');
+
+    const text = await this._chat(`You just made a prediction market trade. Decide if it's worth sharing on the forum.
+
+Trade details:
+- Market: "${trade.market.question}" (event: ${trade.market.eventTitle})
+- Action: ${trade.action} ${trade.shares} shares of outcome #${trade.outcomeIdx}
+- Price: ${trade.executionPrice}
+- Reason: ${trade.reason}
+
+Available channels: ${channelNames}
+
+Rules:
+- Only post if your analysis provides genuine insight to the community.
+- If you post, provide your reasoning and market thesis — not just "I bought X".
+- If the trade is too minor or routine, say NO_POST.
+
+If you want to post, respond with JSON:
+{
+  "channel": "channel_name",
+  "title": "Post title (max 300 chars)",
+  "content": "Your market analysis and thesis"
+}
+
+Otherwise respond with just: NO_POST`, 1024);
+
+    if (text === 'NO_POST' || !text.includes('{')) return null;
+
+    try {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      return jsonMatch ? JSON.parse(jsonMatch[0]) : null;
+    } catch {
+      console.error('[Brain] Failed to parse market post');
+      return null;
+    }
+  }
 }

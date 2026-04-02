@@ -131,16 +131,21 @@ async function sync() {
             // Only overwrite last_price when the order book is liquid enough
             // to produce a meaningful mid-price. Otherwise preserve the Gamma
             // API price written by sync_polymarket (avoids 0.5 placeholder).
-            await client.query(
-                lastPrice !== null
-                    ? `UPDATE polymarket_markets
-                       SET best_bid = $1, best_ask = $2, last_price = $3, price_updated_at = $4
-                       WHERE id = $5`
-                    : `UPDATE polymarket_markets
-                       SET best_bid = $1, best_ask = $2, price_updated_at = $4
-                       WHERE id = $5`,
-                [bestBid, bestAsk, lastPrice, now, marketId]
-            );
+            if (lastPrice !== null) {
+                await client.query(
+                    `UPDATE polymarket_markets
+                     SET best_bid = $1, best_ask = $2, last_price = $3, price_updated_at = $4
+                     WHERE id = $5`,
+                    [bestBid, bestAsk, lastPrice, now, marketId]
+                );
+            } else {
+                await client.query(
+                    `UPDATE polymarket_markets
+                     SET best_bid = $1, best_ask = $2, price_updated_at = $3
+                     WHERE id = $4`,
+                    [bestBid, bestAsk, now, marketId]
+                );
+            }
             updated++;
         }
         await client.query('COMMIT');

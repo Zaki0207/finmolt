@@ -121,6 +121,7 @@ function buildBatchUpsert(table, cols, rows, updateCols, conflictTarget) {
     const updateSet = updateCols.map(c =>
         // Use COALESCE so a null from EXCLUDED never overwrites an existing value.
         // This prevents sync_polymarket from wiping prices written by sync_prices.
+        // Must qualify the fallback column with the table name to avoid ambiguity.
         c === 'last_price' || c === 'price_updated_at' || c === 'best_bid' || c === 'best_ask'
             ? `${c} = COALESCE(EXCLUDED.${c}, ${table}.${c})`
             : `${c} = EXCLUDED.${c}`

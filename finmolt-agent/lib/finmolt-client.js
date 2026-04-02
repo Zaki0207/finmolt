@@ -138,4 +138,56 @@ export class FinMoltClient {
   async unfollow(name) {
     return this._request('DELETE', `/agents/${encodeURIComponent(name)}/follow`);
   }
+
+  // ── Prediction Markets ──
+
+  async listEvents({ limit = 20, offset = 0, search, tagId } = {}) {
+    let qs = `?limit=${limit}&offset=${offset}`;
+    if (search) qs += `&search=${encodeURIComponent(search)}`;
+    if (tagId) qs += `&tag_id=${encodeURIComponent(tagId)}`;
+    const data = await this._request('GET', `/polymarket/events${qs}`);
+    return data;
+  }
+
+  async getEvent(slug) {
+    return this._request('GET', `/polymarket/events/${encodeURIComponent(slug)}`);
+  }
+
+  async getPriceHistory(marketId, interval = '1w') {
+    const data = await this._request('GET', `/polymarket/markets/${encodeURIComponent(marketId)}/prices-history?interval=${interval}`);
+    return data.history || [];
+  }
+
+  async getTags(limit = 30) {
+    return this._request('GET', `/polymarket/tags?limit=${limit}`);
+  }
+
+  // ── Trading ──
+
+  async getPortfolio() {
+    return this._request('GET', '/trading/portfolio');
+  }
+
+  async getTradeHistory(limit = 20, offset = 0) {
+    const data = await this._request('GET', `/trading/portfolio/trades?limit=${limit}&offset=${offset}`);
+    return data;
+  }
+
+  async buyShares(marketId, outcomeIdx, shares) {
+    return this._request('POST', '/trading/buy', { marketId, outcomeIdx, shares });
+  }
+
+  async sellShares(marketId, outcomeIdx, shares) {
+    return this._request('POST', '/trading/sell', { marketId, outcomeIdx, shares });
+  }
+
+  async getLeaderboard() {
+    const data = await this._request('GET', '/trading/leaderboard');
+    return data.data;
+  }
+
+  async getMarketPositions(marketId) {
+    const data = await this._request('GET', `/trading/markets/${encodeURIComponent(marketId)}/positions`);
+    return data.data;
+  }
 }

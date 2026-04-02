@@ -123,10 +123,15 @@ class FinMoltBot {
       // Step 2: Upvote, comment on interesting posts
       await this.engageWithPosts(posts);
 
-      // Step 3: Maybe create an original post
+      // Step 3: Browse and trade prediction markets
+      if (config.trading.enabled) {
+        await this.tradeMarkets();
+      }
+
+      // Step 4: Maybe create an original post
       await this.maybePost();
 
-      // Step 4: Follow active agents
+      // Step 5: Follow active agents
       await this.discoverAgents(posts);
 
       this.log(`Heartbeat #${this.heartbeatCount} complete`);
@@ -253,6 +258,85 @@ class FinMoltBot {
       this.log(`  Post ID: ${post.id}`);
     } catch (err) {
       this.log(`  Post creation failed: ${err.message}`);
+    }
+  }
+
+  async tradeMarkets() {
+    this.log('Browsing prediction markets...');
+
+    try {
+      // Fetch active events with market prices
+      const eventsResponse = await this.client.listEvents({ limit: 20 });
+      const events = eventsResponse.data || [];
+
+      if (!events.length) {
+        this.log('  No active markets found');
+        return;
+      }
+
+      this.log(`  Found ${events.length} active events`);
+
+      // Fetch current portfolio
+      const portfolio = await this.client.getPortfolio();
+      this.log(`  Portfolio: ${portfolio.balance.toFixed(2)} USDC available, ${portfolio.positions.length} open positions`);
+
+      // Use LLM to evaluate markets and decide trades
+      const tradeDecisions = await this.brain.evaluateMarkets(events, portfolio);
+
+      if (!tradeDecisions.length) {
+        this.log('  No trades to make this cycle');
+        return;
+      }
+
+      let tradesExecuted = 0;
+
+      for (const decision of tradeDecisions) {
+        if (tradesExecuted >= config.trading.maxTradesPerHeartbeat) break;
+
+        const { market, action, outcomeIdx, shares, reason } = decision;
+        const clampedShares = Math.min(shares, config.trading.maxPositionSize);
+
+        try {
+          let result;
+          if (action === 'buy') {
+            result = await this.client.buyShares(market.marketId, outcomeIdx, clampedShares);
+            this.log(`  BUY ${clampedShares} shares of "${market.question}" outcome #${outcomeIdx} @ ${result.executionPrice}`);
+            this.log(`    Reason: ${reason}`);
+            this.log(`    Cost: ${result.trade.costUsdc} USDC | Balance: ${result.balance.toFixed(2)} USDC`);
+          } else if (action === 'sell') {
+            result = await this.client.sellShares(market.marketId, outcomeIdx, clampedShares);
+            this.log(`  SELL ${clampedShares} shares of "${market.question}" outcome #${outcomeIdx} @ ${result.executionPrice}`);
+            this.log(`    Reason: ${reason}`);
+            this.log(`    Proceeds: ${result.trade.costUsdc} USDC | P&L: ${result.realisedPnl?.toFixed(4) ?? '?'} | Balance: ${result.balance.toFixed(2)} USDC`);
+          }
+
+          tradesExecuted++;
+
+          // Optionally post about the trade
+          if (config.trading.postAboutTrades && this.postsToday < config.heartbeat.maxPostsPerDay) {
+            try {
+              const channels = await this.client.listChannels();
+              const postIdea = await this.brain.generateMarketPost(
+                { ...decision, executionPrice: result?.executionPrice },
+                channels
+              );
+              if (postIdea) {
+                await this.client.createPost(postIdea.title, postIdea.content, postIdea.channel);
+                this.postsToday++;
+                this.log(`  Posted market analysis: "${postIdea.title}"`);
+              }
+            } catch (err) {
+              this.log(`  Post about trade failed: ${err.message}`);
+            }
+          }
+        } catch (err) {
+          this.log(`  Trade failed (${action} ${market.question}): ${err.message}`);
+        }
+      }
+
+      this.log(`Trading summary: ${tradesExecuted} trades executed`);
+    } catch (err) {
+      this.log(`Market trading error: ${err.message}`);
     }
   }
 
