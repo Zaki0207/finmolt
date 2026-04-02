@@ -30,6 +30,13 @@ function parseOutcomes(raw) {
 }
 
 function formatPosition(p) {
+    const marketClosed = !!(
+        p.market_closed ||
+        p.market_closed_time ||
+        !p.market_active ||
+        p.event_closed ||
+        !p.event_active
+    );
     return {
         id:           p.id,
         marketId:     p.market_id,
@@ -41,6 +48,7 @@ function formatPosition(p) {
         unrealisedPnl: p.unrealised_pnl != null ? parseFloat(p.unrealised_pnl) : null,
         realisedPnl:  parseFloat(p.realised_pnl),
         settledAt:    p.settled_at || null,
+        marketClosed,
         marketQuestion: p.market_question || null,
         eventTitle:   p.event_title    || null,
         eventSlug:    p.event_slug     || null,
@@ -95,8 +103,13 @@ router.get('/portfolio', authMiddleware, async (req, res, next) => {
                 pm.best_ask,
                 pm.last_price,
                 pm.price_updated_at,
+                pm.closed          AS market_closed,
+                pm.active          AS market_active,
+                pm.closed_time     AS market_closed_time,
                 pe.title           AS event_title,
-                pe.slug            AS event_slug
+                pe.slug            AS event_slug,
+                pe.closed          AS event_closed,
+                pe.active          AS event_active
             FROM agent_positions ap
             JOIN polymarket_markets pm ON pm.id = ap.market_id
             JOIN polymarket_events  pe ON pe.id = pm.event_id
@@ -155,16 +168,57 @@ router.get('/portfolio', authMiddleware, async (req, res, next) => {
         const totalPnl      = parseFloat((totalUnrealisedPnl + totalRealisedPnl).toFixed(6));
         const totalPnlPct   = parseFloat(((totalPnl / totalDeposited) * 100).toFixed(2));
 
+        // Fetch recently settled positions (last 20)
+        const { rows: settledRows } = await db.query(`
+            SELECT
+                ap.id, ap.market_id, ap.outcome_idx, ap.shares,
+                ap.avg_cost, ap.realised_pnl, ap.settled_at,
+                pm.question        AS market_question,
+                pm.outcomes::text  AS outcomes,
+                pm.resolved_outcome,
+                pm.closed          AS market_closed,
+                pm.active          AS market_active,
+                pm.closed_time     AS market_closed_time,
+                pe.title           AS event_title,
+                pe.slug            AS event_slug,
+                pe.closed          AS event_closed,
+                pe.active          AS event_active
+            FROM agent_positions ap
+            JOIN polymarket_markets pm ON pm.id = ap.market_id
+            JOIN polymarket_events  pe ON pe.id = pm.event_id
+            WHERE ap.agent_id = $1
+              AND ap.settled_at IS NOT NULL
+            ORDER BY ap.settled_at DESC
+            LIMIT 20
+        `, [agentId]);
+
+        const settledPositions = settledRows.map(p => {
+            const outcomes = parseOutcomes(p.outcomes);
+            return {
+                ...formatPosition(p),
+                outcomeName:     outcomes[p.outcome_idx] || null,
+                resolvedOutcome: p.resolved_outcome || null,
+                currentPrice:    null,
+                unrealisedPnl:   null,
+            };
+        });
+
+        // Include settled realised P&L in totals
+        const totalSettledPnl = settledPositions.reduce((sum, p) => sum + p.realisedPnl, 0);
+        const grandTotalPnl   = parseFloat((totalUnrealisedPnl + totalRealisedPnl + totalSettledPnl).toFixed(6));
+        const grandTotalPnlPct = parseFloat(((grandTotalPnl / totalDeposited) * 100).toFixed(2));
+
         res.json({
             balance,
             totalDeposited,
             positions: formattedPositions,
+            settledPositions,
             summary: {
                 totalValue,
                 unrealisedPnl: parseFloat(totalUnrealisedPnl.toFixed(6)),
-                realisedPnl:   parseFloat(totalRealisedPnl.toFixed(6)),
-                totalPnl,
-                totalPnlPct,
+                realisedPnl:   parseFloat((totalRealisedPnl + totalSettledPnl).toFixed(6)),
+                totalPnl:      grandTotalPnl,
+                totalPnlPct:   grandTotalPnlPct,
             },
         });
     } catch (err) { next(err); }
@@ -223,13 +277,17 @@ router.post('/buy', authMiddleware, async (req, res, next) => {
 
         // Fetch market
         const { rows: marketRows } = await db.query(`
-            SELECT id, question, outcomes::text AS outcomes, active, closed,
-                   best_bid, best_ask, last_price, price_updated_at
-            FROM polymarket_markets WHERE id = $1
+            SELECT pm.id, pm.question, pm.outcomes::text AS outcomes,
+                   pm.active, pm.closed, pm.closed_time,
+                   pm.best_bid, pm.best_ask, pm.last_price, pm.price_updated_at,
+                   pe.closed AS event_closed, pe.active AS event_active
+            FROM polymarket_markets pm
+            JOIN polymarket_events pe ON pe.id = pm.event_id
+            WHERE pm.id = $1
         `, [marketId]);
         if (marketRows.length === 0) return res.status(404).json({ error: 'Market not found' });
         const market = marketRows[0];
-        if (!market.active || market.closed) {
+        if (!market.active || market.closed || market.closed_time || market.event_closed || !market.event_active) {
             return res.status(400).json({ error: 'Market is not active' });
         }
 
@@ -331,14 +389,20 @@ router.post('/sell', authMiddleware, async (req, res, next) => {
             return res.status(400).json({ error: 'shares must be a positive number' });
         }
 
-        // Fetch market (allow selling even if closed, for exit)
         const { rows: marketRows } = await db.query(`
-            SELECT id, question, outcomes::text AS outcomes,
-                   best_bid, best_ask, last_price, price_updated_at
-            FROM polymarket_markets WHERE id = $1
+            SELECT pm.id, pm.question, pm.outcomes::text AS outcomes,
+                   pm.active, pm.closed, pm.closed_time,
+                   pm.best_bid, pm.best_ask, pm.last_price, pm.price_updated_at,
+                   pe.closed AS event_closed, pe.active AS event_active
+            FROM polymarket_markets pm
+            JOIN polymarket_events pe ON pe.id = pm.event_id
+            WHERE pm.id = $1
         `, [marketId]);
         if (marketRows.length === 0) return res.status(404).json({ error: 'Market not found' });
         const market = marketRows[0];
+        if (!market.active || market.closed || market.closed_time || market.event_closed || !market.event_active) {
+            return res.status(400).json({ error: 'Market is closed — positions will be settled automatically' });
+        }
 
         // Determine execution price
         const priceResult = getExecutionPrice(market, 'sell');
@@ -361,6 +425,26 @@ router.post('/sell', authMiddleware, async (req, res, next) => {
             await client.query('ROLLBACK');
             const held = posRows.length > 0 ? parseFloat(posRows[0].shares) : 0;
             return res.status(400).json({ error: 'Insufficient shares', held, requested: sharesNum });
+        }
+
+        // Re-verify market is still open inside the transaction (guard against race with sync closing the market)
+        const { rows: mktCheck } = await client.query(
+            `SELECT active, closed, closed_time, pe.closed AS event_closed, pe.active AS event_active
+             FROM polymarket_markets pm
+             JOIN polymarket_events pe ON pe.id = pm.event_id
+             WHERE pm.id = $1 FOR SHARE`,
+            [marketId]
+        );
+        if (
+            mktCheck.length === 0 ||
+            !mktCheck[0].active ||
+            mktCheck[0].closed ||
+            mktCheck[0].closed_time ||
+            mktCheck[0].event_closed ||
+            !mktCheck[0].event_active
+        ) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'Market is closed — positions will be settled automatically' });
         }
 
         const position    = posRows[0];

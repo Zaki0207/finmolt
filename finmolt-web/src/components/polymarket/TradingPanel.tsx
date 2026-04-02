@@ -12,7 +12,7 @@ const QUICK_AMOUNTS = [1, 5, 10, 100];
 const STALE_THRESHOLD_MS = 10 * 60 * 1000;
 
 function isStale(priceUpdatedAt?: string | null) {
-    if (!priceUpdatedAt) return false; // no timestamp = treat as fresh (API may not provide it)
+    if (!priceUpdatedAt) return true; // no timestamp = never been priced, treat as stale
     return Date.now() - new Date(priceUpdatedAt).getTime() > STALE_THRESHOLD_MS;
 }
 
@@ -26,9 +26,11 @@ interface TradingPanelProps {
     side?: 'buy' | 'sell';
     /** Callback when user switches Buy/Sell, for parent to update shared state */
     onSideChange?: (side: 'buy' | 'sell') => void;
+    /** Pass true when the parent event is closed, regardless of market-level flags */
+    eventClosed?: boolean;
 }
 
-export function TradingPanel({ market, outcomeLabel, outcomeImage, side: sideProp, onSideChange }: TradingPanelProps) {
+export function TradingPanel({ market, outcomeLabel, outcomeImage, side: sideProp, onSideChange, eventClosed }: TradingPanelProps) {
     const { isAuthenticated, isHydrated } = useAuth();
     const { data: portfolio } = usePortfolio();
     const { trade, isTrading, tradeError, clearError } = useTrade();
@@ -52,9 +54,9 @@ export function TradingPanel({ market, outcomeLabel, outcomeImage, side: sidePro
     // with placeholder ask=1.0/bid=0), fall back to lastPrice for all sides.
     const liquid = isOrderBookLiquid(market);
     const yesBuyPrice  = liquid ? market.bestAsk  : market.lastPrice;
-    const noBuyPrice   = liquid ? 1 - market.bestBid! : market.lastPrice;
+    const noBuyPrice   = liquid ? 1 - market.bestBid! : (market.lastPrice != null ? 1 - market.lastPrice : null);
     const yesSellPrice = liquid ? market.bestBid  : market.lastPrice;
-    const noSellPrice  = liquid ? 1 - market.bestAsk! : market.lastPrice;
+    const noSellPrice  = liquid ? 1 - market.bestAsk! : (market.lastPrice != null ? 1 - market.lastPrice : null);
 
     const displayYesPrice = side === 'buy' ? yesBuyPrice  : yesSellPrice;
     const displayNoPrice  = side === 'buy' ? noBuyPrice   : noSellPrice;
@@ -120,7 +122,7 @@ export function TradingPanel({ market, outcomeLabel, outcomeImage, side: sidePro
         );
     }
 
-    if (!market.active || market.closed) {
+    if (eventClosed || !market.active || market.closed || !!market.closedTime) {
         return (
             <div className="rounded-xl border bg-muted/30 p-6 text-center text-sm text-muted-foreground">
                 This market is closed — trading is disabled

@@ -11,9 +11,11 @@ export interface AgentPosition {
     unrealisedPnl: number | null;
     realisedPnl: number;
     settledAt: string | null;
+    marketClosed: boolean;
     marketQuestion: string | null;
     eventTitle: string | null;
     eventSlug: string | null;
+    resolvedOutcome?: string | null;
 }
 
 export interface PortfolioSummary {
@@ -28,6 +30,7 @@ export interface AgentPortfolio {
     balance: number;
     totalDeposited: number;
     positions: AgentPosition[];
+    settledPositions: AgentPosition[];
     summary: PortfolioSummary;
 }
 

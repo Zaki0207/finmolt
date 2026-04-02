@@ -87,6 +87,7 @@ async function sync() {
         FROM polymarket_markets
         WHERE active = true
           AND closed = false
+          AND neg_risk = false
           AND clob_token_ids != '[]'::jsonb
           AND clob_token_ids IS NOT NULL
         ORDER BY fetched_at DESC

@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import { redirect } from 'next/navigation';
-import { TrendingUp, TrendingDown, Wallet, BarChart2, Clock, ArrowLeft, Loader2 } from 'lucide-react';
+import { TrendingUp, TrendingDown, Wallet, BarChart2, Clock, ArrowLeft, Loader2, CheckCircle2 } from 'lucide-react';
 import { PageContainer } from '@/components/layout';
 import { Card, Skeleton } from '@/components/ui';
 import { cn } from '@/lib/utils';
@@ -53,6 +53,7 @@ function PositionCard({ position }: { position: AgentPosition }) {
     const [sellShares, setSellShares] = useState('');
     const [showSell, setShowSell] = useState(false);
     const [successMsg, setSuccessMsg] = useState<string | null>(null);
+    const isClosed = position.marketClosed;
 
     const pnl = position.unrealisedPnl ?? 0;
     const pnlPct = position.avgCost > 0 && position.currentPrice != null
@@ -112,8 +113,10 @@ function PositionCard({ position }: { position: AgentPosition }) {
                 </div>
             </div>
 
-            {/* Sell inline */}
-            {!showSell ? (
+            {/* Sell inline — hidden for closed markets (awaiting settlement) */}
+            {isClosed ? (
+                <p className="text-xs text-muted-foreground italic">Awaiting market resolution — will settle automatically</p>
+            ) : !showSell ? (
                 <button onClick={() => setShowSell(true)} className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2">
                     Sell position
                 </button>
@@ -147,6 +150,65 @@ function PositionCard({ position }: { position: AgentPosition }) {
     );
 }
 
+// ── Settled Position Card ─────────────────────────────────────────────────────
+
+function SettledPositionCard({ position }: { position: AgentPosition }) {
+    const pnl = position.realisedPnl;
+    const pnlPct = position.avgCost > 0
+        ? ((pnl / (position.avgCost * (position.shares || 1))) * 100)
+        : null;
+
+    return (
+        <Card className="p-4 space-y-3 opacity-75">
+            <div className="flex items-start justify-between gap-2">
+                <div className="space-y-0.5 flex-1 min-w-0">
+                    {position.eventSlug ? (
+                        <Link href={`/polymarket/${position.eventSlug}`} className="text-xs text-muted-foreground hover:underline truncate block">
+                            {position.eventTitle}
+                        </Link>
+                    ) : (
+                        <p className="text-xs text-muted-foreground truncate">{position.eventTitle}</p>
+                    )}
+                    <p className="text-sm font-medium leading-snug">{position.marketQuestion}</p>
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                    {position.resolvedOutcome && (
+                        <span className="flex items-center gap-1 text-xs text-green-600 dark:text-green-400 font-medium">
+                            <CheckCircle2 className="h-3.5 w-3.5" />
+                            {position.resolvedOutcome}
+                        </span>
+                    )}
+                    <span className={cn(
+                        'rounded-full px-2 py-0.5 text-xs font-semibold',
+                        position.outcomeIdx === 0
+                            ? 'bg-finmolt-500/10 text-finmolt-600 dark:text-finmolt-400'
+                            : 'bg-muted text-muted-foreground'
+                    )}>
+                        {position.outcomeName ?? `#${position.outcomeIdx}`}
+                    </span>
+                </div>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2 text-xs">
+                <div>
+                    <p className="text-muted-foreground">Avg Cost</p>
+                    <p className="font-semibold">${position.avgCost.toFixed(3)}</p>
+                </div>
+                <div>
+                    <p className="text-muted-foreground">Realised P&L</p>
+                    <PnlBadge value={pnl} />
+                </div>
+                <div>
+                    <p className="text-muted-foreground">Settled</p>
+                    <p className="font-semibold text-muted-foreground">
+                        {position.settledAt ? new Date(position.settledAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '—'}
+                    </p>
+                </div>
+            </div>
+        </Card>
+    );
+}
+
 // ── Trade Row ─────────────────────────────────────────────────────────────────
 
 function TradeRow({ trade }: { trade: TradeLedgerEntry }) {
@@ -170,7 +232,7 @@ function TradeRow({ trade }: { trade: TradeLedgerEntry }) {
                 </div>
                 <div className="flex items-center gap-1 text-muted-foreground">
                     <Clock className="h-3 w-3" />
-                    {new Date(trade.createdAt).toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                    {new Date(trade.createdAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                 </div>
             </div>
         </div>
@@ -197,13 +259,14 @@ function PortfolioSkeleton() {
 // ── Page ──────────────────────────────────────────────────────────────────────
 
 export default function PortfolioPage() {
-    const { isAuthenticated, isHydrated } = useAuth();
+    const { isAuthenticated, isHydrated, apiKey } = useAuth();
     const { data: portfolio, isLoading: portLoading } = usePortfolio();
     const { data: tradesData, isLoading: tradesLoading } = usePortfolioTrades(20, 0);
     const [tradesOffset, setTradesOffset] = useState(0);
     usePortfolioTrades(20, tradesOffset); // prefetch next page
 
-    if (!isHydrated || portLoading) return <PortfolioSkeleton />;
+    // Show skeleton while hydrating, loading portfolio, or apiKey exists but agent not yet fetched
+    if (!isHydrated || portLoading || (apiKey && !isAuthenticated)) return <PortfolioSkeleton />;
     if (!isAuthenticated) {
         redirect('/auth/login');
     }
@@ -227,19 +290,47 @@ export default function PortfolioPage() {
                         <SummaryCards balance={portfolio.balance} summary={portfolio.summary} />
 
                         {/* Open Positions */}
-                        <div className="space-y-3">
-                            <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide px-1">
-                                Open Positions ({portfolio.positions.length})
-                            </h2>
-                            {portfolio.positions.length === 0 ? (
-                                <Card className="p-8 text-center text-sm text-muted-foreground">
-                                    No open positions yet.{' '}
-                                    <Link href="/polymarket" className="text-primary hover:underline">Browse markets</Link>
-                                </Card>
-                            ) : (
-                                portfolio.positions.map(p => <PositionCard key={`${p.marketId}-${p.outcomeIdx}`} position={p} />)
-                            )}
-                        </div>
+                        {(() => {
+                            const open    = portfolio.positions.filter(p => !p.marketClosed);
+                            const pending = portfolio.positions.filter(p => p.marketClosed);
+                            return (
+                                <>
+                                    <div className="space-y-3">
+                                        <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide px-1">
+                                            Open Positions ({open.length})
+                                        </h2>
+                                        {open.length === 0 ? (
+                                            <Card className="p-8 text-center text-sm text-muted-foreground">
+                                                No open positions yet.{' '}
+                                                <Link href="/polymarket" className="text-primary hover:underline">Browse markets</Link>
+                                            </Card>
+                                        ) : (
+                                            open.map(p => <PositionCard key={`${p.marketId}-${p.outcomeIdx}`} position={p} />)
+                                        )}
+                                    </div>
+                                    {pending.length > 0 && (
+                                        <div className="space-y-3">
+                                            <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide px-1">
+                                                Pending Settlement ({pending.length})
+                                            </h2>
+                                            {pending.map(p => <PositionCard key={`${p.marketId}-${p.outcomeIdx}`} position={p} />)}
+                                        </div>
+                                    )}
+                                </>
+                            );
+                        })()}
+
+                        {/* Settled Positions */}
+                        {(portfolio.settledPositions ?? []).length > 0 && (
+                            <div className="space-y-3">
+                                <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide px-1">
+                                    Settled ({portfolio.settledPositions.length})
+                                </h2>
+                                {portfolio.settledPositions.map(p => (
+                                    <SettledPositionCard key={`${p.marketId}-${p.outcomeIdx}`} position={p} />
+                                ))}
+                            </div>
+                        )}
 
                         {/* Trade History */}
                         <div className="space-y-3">

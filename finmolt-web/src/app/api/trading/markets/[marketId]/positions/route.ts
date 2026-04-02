@@ -8,9 +8,11 @@ export async function GET(
 ) {
     const { marketId } = await params;
 
+    const auth = _request.headers.get('Authorization') ?? '';
     try {
         const res = await fetch(`${API_BASE}/trading/markets/${marketId}/positions`, {
             next: { revalidate: 30 },
+            ...(auth ? { headers: { Authorization: auth } } : {}),
         });
         return NextResponse.json(await res.json(), { status: res.status });
     } catch (err) {

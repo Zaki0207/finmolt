@@ -11,7 +11,7 @@
 | Phase 3 | 前端 Next.js API 代理 | ✅ 完成 |
 | Phase 4 | 前端类型与 API 客户端 | ✅ 完成 |
 | Phase 5 | 前端页面与组件 | ✅ 完成 |
-| Phase 6 | 市场结算（自动清算） | ⏳ 待实现 |
+| Phase 6 | 市场结算（自动清算） | ✅ 完成 |
 
 ---
 
@@ -165,7 +165,7 @@
 
 ---
 
-## ⏳ Phase 6 — 市场结算（待实现）
+## ✅ Phase 6 — 市场结算
 
 **目标文件：** `finmolt-api/scripts/sync_polymarket.js`
 
@@ -222,4 +222,4 @@ WHERE id = '<test_market_id>';
 | 前端页面 `/polymarket/portfolio` | HTTP 200 | ✅ |
 | 前端页面 `/polymarket/leaderboard` | HTTP 200 | ✅ |
 | Next.js 代理鉴权转发 | `/api/trading/portfolio` 无 auth → 401 | ✅ |
-| 市场结算 | 已 resolved 市场自动清算持仓 | ⏳ 待实现 |
+| 市场结算 | 已 resolved 市场自动清算持仓 | ✅ |

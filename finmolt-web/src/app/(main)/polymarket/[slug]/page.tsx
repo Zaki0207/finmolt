@@ -17,10 +17,11 @@ import type { MarketPositionsResponse } from '@/lib/trading';
 // ── Agent Positions widget ────────────────────────────────────────────────────
 
 function AgentPositions({ marketId, outcomes }: { marketId: string; outcomes: string[] }) {
-    const { data, isLoading } = useMarketPositions(marketId);
+    const { data, isLoading, error } = useMarketPositions(marketId);
     const positions = (data as MarketPositionsResponse | undefined)?.data ?? [];
 
     if (isLoading) return <Skeleton className="h-20 w-full" />;
+    if (error) return <p className="text-xs text-muted-foreground">Failed to load agent positions</p>;
     if (positions.length === 0) return null;
 
     return (
@@ -78,9 +79,9 @@ function OutcomeRow({
     // When the order book is illiquid (spread >= 0.9), fall back to lastPrice.
     const liquid = isOrderBookLiquid(market);
     const yesBuyPrice  = liquid ? market.bestAsk  : market.lastPrice;
-    const noBuyPrice   = liquid ? 1 - market.bestBid! : market.lastPrice;
+    const noBuyPrice   = liquid ? 1 - market.bestBid! : (market.lastPrice != null ? 1 - market.lastPrice : null);
     const yesSellPrice = liquid ? market.bestBid  : market.lastPrice;
-    const noSellPrice  = liquid ? 1 - market.bestAsk! : market.lastPrice;
+    const noSellPrice  = liquid ? 1 - market.bestAsk! : (market.lastPrice != null ? 1 - market.lastPrice : null);
     const displayYesPrice = side === 'buy' ? yesBuyPrice : yesSellPrice;
     const displayNoPrice  = side === 'buy' ? noBuyPrice  : noSellPrice;
     const isClosed = market.closed || !!market.closedTime;
@@ -331,6 +332,7 @@ export default function PolymarketEventPage({
                                 outcomeImage={tradingOutcomeImage ?? undefined}
                                 side={side}
                                 onSideChange={setSide}
+                                eventClosed={event.closed || !event.active}
                             />
                         </div>
                     </div>
@@ -344,6 +346,7 @@ export default function PolymarketEventPage({
                                 outcomeImage={tradingOutcomeImage ?? undefined}
                                 side={side}
                                 onSideChange={setSide}
+                                eventClosed={event.closed || !event.active}
                             />
                         </div>
                     </div>

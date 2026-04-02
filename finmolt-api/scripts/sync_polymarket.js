@@ -57,18 +57,30 @@ async function fetchAllEvents() {
     );
     console.log(`Fetched ${active.length} active events`);
 
-    // Fetch recently closed events (catch resolutions — cap at 500 to keep sync fast)
+    // Fetch recently closed events (catch resolutions — cap at 500 to keep sync fast).
+    // Sort by closedTime desc so the most recently closed events are always captured
+    // within the cap, regardless of how many total closed events exist.
     const closed = await fetchAllPages(
-        { closed: 'true', order: 'id', ascending: 'false' },
+        { closed: 'true', order: 'closedTime', ascending: 'false' },
         'closed',
         500
     );
     console.log(`Fetched ${closed.length} recently closed events`);
 
-    // Deduplicate by id (active takes precedence)
+    // Fetch inactive-but-not-yet-closed events (e.g. recurring 5-min markets that
+    // have expired: event.active=false, event.closed=false). These fall through both
+    // queries above but their individual markets may have closed=true on the API.
+    const inactive = await fetchAllPages(
+        { active: 'false', closed: 'false', order: 'id', ascending: 'false' },
+        'inactive',
+        500
+    );
+    console.log(`Fetched ${inactive.length} inactive (limbo) events`);
+
+    // Deduplicate by id (active > inactive > closed precedence)
     const seen = new Set();
     const merged = [];
-    for (const e of [...active, ...closed]) {
+    for (const e of [...active, ...inactive, ...closed]) {
         if (!seen.has(e.id)) {
             seen.add(e.id);
             merged.push(e);
@@ -110,7 +122,7 @@ function buildBatchUpsert(table, cols, rows, updateCols, conflictTarget) {
         // Use COALESCE so a null from EXCLUDED never overwrites an existing value.
         // This prevents sync_polymarket from wiping prices written by sync_prices.
         c === 'last_price' || c === 'price_updated_at' || c === 'best_bid' || c === 'best_ask'
-            ? `${c} = COALESCE(EXCLUDED.${c}, ${c})`
+            ? `${c} = COALESCE(EXCLUDED.${c}, ${table}.${c})`
             : `${c} = EXCLUDED.${c}`
     ).join(', ');
     const onConflict = updateCols.length > 0
@@ -162,11 +174,6 @@ async function batchUpsertEvents(client, events) {
  */
 function extractYesPrice(m) {
     try {
-        // negRisk multi-outcome markets: Gamma API always returns outcomePrices=["0.5","0.5"]
-        // as a placeholder. The real per-outcome prices come from the CLOB price history,
-        // not from this field. Skip to avoid overwriting correct prices.
-        if (m.negRisk) return null;
-
         const raw = m.outcomePrices;
         if (!raw) return null;
         const arr = Array.isArray(raw) ? raw : JSON.parse(raw);
@@ -202,6 +209,16 @@ async function batchUpsertMarkets(client, allMarkets) {
         const batch = allMarkets.slice(i, i + BATCH_SIZE);
         const rows = batch.map(m => {
             const yesPrice = extractYesPrice(m);
+            // Derive resolved_outcome from outcomePrices collapse (0/1) when not explicit
+            let resolvedOutcome = m.resolvedOutcome || null;
+            if (!resolvedOutcome && m.closed) {
+                try {
+                    const prices   = Array.isArray(m.outcomePrices) ? m.outcomePrices : JSON.parse(m.outcomePrices || '[]');
+                    const outcomes = parseOutcomes(m.outcomes);
+                    const winIdx   = prices.findIndex(p => parseFloat(p) === 1);
+                    if (winIdx !== -1 && outcomes[winIdx]) resolvedOutcome = outcomes[winIdx];
+                } catch { /* ignore */ }
+            }
             return [
                 m.id,
                 m._eventId,
@@ -215,14 +232,13 @@ async function batchUpsertMarkets(client, allMarkets) {
                 !!m.negRisk,
                 m.active,
                 m.closed,
-                m.resolvedOutcome || null,
+                resolvedOutcome,
                 m.startDate || null,
                 m.endDate || null,
                 m.closedTime || null,
                 now,
-                // negRisk: Gamma returns placeholder 0.5/0.5 — null out so CLOB sync owns these
-                m.negRisk ? null : (m.bestBid != null ? parseFloat(m.bestBid) : null),
-                m.negRisk ? null : (m.bestAsk != null ? parseFloat(m.bestAsk) : null),
+                m.bestBid != null ? parseFloat(m.bestBid) : null,
+                m.bestAsk != null ? parseFloat(m.bestAsk) : null,
                 yesPrice,
                 (m.bestBid != null || m.bestAsk != null || yesPrice !== null) ? now : null,
                 m.volume   != null ? parseFloat(m.volume)   : null,
@@ -259,6 +275,205 @@ async function batchUpsertEventTags(client, eventTagPairs) {
         const q = buildBatchUpsert('polymarket_event_tags', cols, rows, [], '(event_id, tag_id)');
         await client.query(q.text, q.values);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Targeted re-sync: refresh markets that have open positions
+// ---------------------------------------------------------------------------
+
+/**
+ * For every market that has unsettled agent positions, fetch the current
+ * status directly from the Gamma API (/events/:id) and update the DB.
+ * This is necessary because the Polymarket list API caps at 500 results,
+ * which is not enough to cover the volume of recurring short-duration markets.
+ */
+async function refreshPositionMarkets() {
+    // Find distinct event IDs that have unsettled positions
+    const { rows } = await pool.query(`
+        SELECT DISTINCT pm.event_id, pm.id AS market_id
+        FROM agent_positions ap
+        JOIN polymarket_markets pm ON pm.id = ap.market_id
+        WHERE ap.settled_at IS NULL AND ap.shares > 0
+    `);
+
+    if (rows.length === 0) return;
+
+    const eventIds = [...new Set(rows.map(r => r.event_id))];
+    console.log(`[refresh] Re-fetching ${eventIds.length} event(s) with open positions…`);
+
+    for (const eventId of eventIds) {
+        try {
+            const res = await fetch(`${POLYMARKET_BASE}/events/${eventId}`);
+            if (!res.ok) {
+                console.warn(`  [refresh] Event ${eventId}: HTTP ${res.status}`);
+                continue;
+            }
+            const event = await res.json();
+
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+
+                // Update event row
+                await client.query(`
+                    UPDATE polymarket_events
+                    SET active = $1, closed = $2, fetched_at = NOW()
+                    WHERE id = $3
+                `, [event.active, event.closed, eventId]);
+
+                // Update each market nested in the event
+                for (const m of (event.markets || [])) {
+                    // Derive resolved_outcome from outcomePrices if not explicitly set.
+                    // Polymarket recurring markets collapse prices to "0"/"1" on resolution
+                    // instead of writing resolvedOutcome. Price "1" = winning outcome.
+                    let resolvedOutcome = m.resolvedOutcome || null;
+                    if (!resolvedOutcome && m.closed) {
+                        try {
+                            const prices  = Array.isArray(m.outcomePrices) ? m.outcomePrices : JSON.parse(m.outcomePrices || '[]');
+                            const outcomes = parseOutcomes(m.outcomes);
+                            const winIdx  = prices.findIndex(p => parseFloat(p) === 1);
+                            if (winIdx !== -1 && outcomes[winIdx]) {
+                                resolvedOutcome = outcomes[winIdx];
+                            }
+                        } catch { /* ignore parse errors */ }
+                    }
+
+                    await client.query(`
+                        UPDATE polymarket_markets
+                        SET active           = $1,
+                            closed           = $2,
+                            closed_time      = $3,
+                            resolved_outcome = $4,
+                            fetched_at       = NOW()
+                        WHERE id = $5
+                    `, [
+                        m.active,
+                        m.closed,
+                        m.closedTime || null,
+                        resolvedOutcome,
+                        m.id,
+                    ]);
+                }
+
+                await client.query('COMMIT');
+                console.log(`  [refresh] Event ${eventId} (${event.title?.substring(0, 50)}): active=${event.active}, closed=${event.closed}`);
+            } catch (err) {
+                await client.query('ROLLBACK').catch(() => {});
+                console.error(`  [refresh] Event ${eventId} DB update failed:`, err.message);
+            } finally {
+                client.release();
+            }
+        } catch (err) {
+            console.error(`  [refresh] Event ${eventId} fetch failed:`, err.message);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — Market settlement
+// ---------------------------------------------------------------------------
+
+/**
+ * Settle all unsettled positions for resolved & closed markets.
+ * One transaction per market so row-level locks stay short.
+ * Returns total number of positions settled.
+ */
+async function settleMarkets() {
+    const { rows: markets } = await pool.query(`
+        SELECT pm.id, pm.resolved_outcome, pm.outcomes, pm.question,
+               pm.last_price, pm.best_bid, pm.best_ask
+        FROM polymarket_markets pm
+        WHERE pm.resolved_outcome IS NOT NULL
+          AND pm.closed = true
+          AND EXISTS (
+              SELECT 1 FROM agent_positions ap
+              WHERE ap.market_id = pm.id
+                AND ap.settled_at IS NULL
+                AND ap.shares > 0
+          )
+    `);
+
+    if (markets.length === 0) return 0;
+
+    console.log(`[settle] ${markets.length} resolved market(s) with unsettled positions`);
+
+    let totalSettled = 0;
+
+    for (const market of markets) {
+        const outcomes = Array.isArray(market.outcomes)
+            ? market.outcomes
+            : JSON.parse(market.outcomes || '[]');
+
+        let winningIdx = outcomes.findIndex(o =>
+            String(o).toLowerCase().trim() === String(market.resolved_outcome).toLowerCase().trim()
+        );
+
+        // Fallback: for binary markets, infer winner from stored price (last_price ≈ 1.0 → YES won)
+        if (winningIdx === -1 && outcomes.length === 2) {
+            const price = parseFloat(market.last_price ?? market.best_ask ?? market.best_bid ?? 'NaN');
+            if (price >= 0.99) winningIdx = 0;        // YES won
+            else if (price <= 0.01) winningIdx = 1;   // NO won
+        }
+
+        if (winningIdx === -1) {
+            console.warn(
+                `  [settle] Market ${market.id}: resolved_outcome "${market.resolved_outcome}" ` +
+                `not found in ${JSON.stringify(outcomes)} — skipping`
+            );
+            continue;
+        }
+
+        const client = await pool.connect();
+        try {
+            await client.query('BEGIN');
+
+            const { rows: positions } = await client.query(`
+                SELECT id, agent_id, outcome_idx, shares, avg_cost
+                FROM agent_positions
+                WHERE market_id = $1 AND settled_at IS NULL AND shares > 0
+                FOR UPDATE
+            `, [market.id]);
+
+            for (const pos of positions) {
+                const isWinner     = Number(pos.outcome_idx) === winningIdx;
+                const payout       = parseFloat(pos.shares) * (isWinner ? 1.0 : 0.0);
+                const realisedPnl  = parseFloat(pos.shares) * ((isWinner ? 1.0 : 0.0) - parseFloat(pos.avg_cost));
+
+                if (payout > 0) {
+                    await client.query(`
+                        UPDATE agent_portfolios
+                        SET balance_usdc = balance_usdc + $1, updated_at = NOW()
+                        WHERE agent_id = $2
+                    `, [payout, pos.agent_id]);
+                }
+
+                await client.query(`
+                    UPDATE agent_positions
+                    SET shares       = 0,
+                        realised_pnl = realised_pnl + $1,
+                        settled_at   = NOW(),
+                        updated_at   = NOW()
+                    WHERE id = $2
+                `, [realisedPnl, pos.id]);
+            }
+
+            await client.query('COMMIT');
+
+            const label = (market.question || market.id).substring(0, 60);
+            console.log(
+                `  [settle] "${label}…" winner=${outcomes[winningIdx]}(idx ${winningIdx}),` +
+                ` settled ${positions.length} position(s)`
+            );
+            totalSettled += positions.length;
+        } catch (err) {
+            await client.query('ROLLBACK').catch(() => {});
+            console.error(`  [settle] Market ${market.id} failed:`, err.message);
+        } finally {
+            client.release();
+        }
+    }
+
+    return totalSettled;
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +579,15 @@ async function sync() {
                   AND id != ALL($1::varchar[])
             `, [activeIds]);
             await client.query('COMMIT');
+        }
+
+        // --- Targeted refresh: re-fetch markets with open positions to get latest status ---
+        await refreshPositionMarkets();
+
+        // --- Settlement: resolve positions for closed/resolved markets ---
+        const settledCount = await settleMarkets();
+        if (settledCount > 0) {
+            console.log(`Settlement complete: ${settledCount} position(s) settled`);
         }
 
         const elapsed = ((Date.now() - start) / 1000).toFixed(1);
