@@ -7,7 +7,12 @@
 //   node scripts/sync_polymarket.js --watch    # repeat every SYNC_INTERVAL_MS (default 10 min)
 
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 const { Pool } = require('pg');
+const { validateSync } = require('./validate_sync');
+
+const STATUS_FILE = process.env.SYNC_STATUS_FILE || null;
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
@@ -481,9 +486,17 @@ async function settleMarkets() {
 // Main sync
 // ---------------------------------------------------------------------------
 
+function writeStatus(data) {
+    if (!STATUS_FILE) return;
+    try {
+        fs.writeFileSync(STATUS_FILE, JSON.stringify(data) + '\n');
+    } catch { /* ignore */ }
+}
+
 async function sync() {
     const start = Date.now();
     console.log(`[${new Date().toISOString()}] Starting Polymarket sync…`);
+    writeStatus({ status: 'syncing', startedAt: new Date().toISOString(), intervalMs: SYNC_INTERVAL_MS });
 
     let events, activeIds;
     try {
@@ -492,6 +505,11 @@ async function sync() {
         activeIds = result.activeIds;
     } catch (err) {
         console.error('Fetch failed:', err.message);
+        writeStatus({
+            status: 'error', error: err.message,
+            lastSync: new Date().toISOString(), durationSec: ((Date.now() - start) / 1000).toFixed(1),
+            intervalMs: SYNC_INTERVAL_MS, nextSync: new Date(Date.now() + SYNC_INTERVAL_MS).toISOString(),
+        });
         return;
     }
 
@@ -593,11 +611,29 @@ async function sync() {
 
         const elapsed = ((Date.now() - start) / 1000).toFixed(1);
         console.log(`Done. ${events.length} events, ${allMarkets.length} markets synced in ${elapsed}s`);
+        writeStatus({
+            status: 'ok', lastSync: new Date().toISOString(), durationSec: elapsed,
+            events: events.length, markets: allMarkets.length, settled: settledCount || 0,
+            intervalMs: SYNC_INTERVAL_MS, nextSync: new Date(Date.now() + SYNC_INTERVAL_MS).toISOString(),
+        });
     } catch (err) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('DB upsert failed:', err.message);
+        writeStatus({
+            status: 'error', error: err.message,
+            lastSync: new Date().toISOString(), durationSec: ((Date.now() - start) / 1000).toFixed(1),
+            intervalMs: SYNC_INTERVAL_MS, nextSync: new Date(Date.now() + SYNC_INTERVAL_MS).toISOString(),
+        });
     } finally {
         client.release();
+    }
+
+    // Post-sync validation: check for data anomalies, auto-correct where safe,
+    // and write a sync health report to sync-health.json.
+    try {
+        await validateSync(pool);
+    } catch (err) {
+        console.error('[validate] Validation failed (non-fatal):', err.message);
     }
 }
 

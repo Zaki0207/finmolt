@@ -187,6 +187,14 @@ main() {
         else
             warn "价格同步失败，市场价格暂时不可用"
         fi
+
+        # 初次同步完成后运行数据完整性校验（validate_sync 也在每次 polymarket sync 结束时自动调用）
+        step "数据完整性校验"
+        if (cd "$API_DIR" && node scripts/validate_sync.js); then
+            log "数据校验完成 ✓  报告: $API_DIR/sync-health.json"
+        else
+            warn "数据校验异常，请查看 $API_DIR/sync-health.json"
+        fi
     fi
 
     # ─── 6. 启动 API ───
@@ -217,12 +225,14 @@ main() {
         POLYMARKET_SYNC_INTERVAL_MS="${POLYMARKET_SYNC_INTERVAL_MS:-600000}"
         log "启动 Polymarket 同步 (每 $((POLYMARKET_SYNC_INTERVAL_MS / 1000))s)..."
         (cd "$API_DIR" && POLYMARKET_SYNC_INTERVAL_MS="$POLYMARKET_SYNC_INTERVAL_MS" \
+            SYNC_STATUS_FILE="$PID_DIR/polymarket_status.json" \
             node scripts/sync_polymarket.js --watch > "$PID_DIR/polymarket.log" 2>&1) &
         echo $! > "$PID_DIR/polymarket.pid"
 
         PRICES_SYNC_INTERVAL_MS="${PRICES_SYNC_INTERVAL_MS:-120000}"
         log "启动 CLOB 价格同步 (每 $((PRICES_SYNC_INTERVAL_MS / 1000))s)..."
         (cd "$API_DIR" && PRICES_SYNC_INTERVAL_MS="$PRICES_SYNC_INTERVAL_MS" \
+            SYNC_STATUS_FILE="$PID_DIR/prices_status.json" \
             node scripts/sync_prices.js --watch > "$PID_DIR/prices.log" 2>&1) &
         echo $! > "$PID_DIR/prices.pid"
         log "后台同步进程已启动 ✓"
@@ -271,8 +281,9 @@ main() {
     echo -e "  ${GREEN}前端${NC}      http://localhost:$WEB_PORT"
     echo -e "  ${GREEN}API${NC}       http://localhost:$API_PORT"
     if [[ "$SKIP_POLYMARKET" == false ]]; then
-        echo -e "  ${GREEN}市场同步${NC}  每 $((POLYMARKET_SYNC_INTERVAL_MS / 1000))s"
+        echo -e "  ${GREEN}市场同步${NC}  每 $((POLYMARKET_SYNC_INTERVAL_MS / 1000))s (含自动数据校验)"
         echo -e "  ${GREEN}价格同步${NC}  每 $((PRICES_SYNC_INTERVAL_MS / 1000))s (CLOB)"
+        echo -e "  ${GREEN}健康报告${NC}  $API_DIR/sync-health.json"
     fi
     [[ "$AGENT_STARTED" == true ]] && echo -e "  ${GREEN}Agent Bot${NC} 运行中"
     echo ""
@@ -281,8 +292,206 @@ main() {
     echo -e "${CYAN}══════════════════════════════════════${NC}"
     echo ""
 
-    # 保持前台，等待任意子进程退出
-    wait -n 2>/dev/null && warn "某个服务已退出，按 Ctrl+C 停止全部" && wait || wait
+    # ─── 实时状态面板 ───
+    if [[ "$SKIP_POLYMARKET" == false ]]; then
+        status_dashboard
+    else
+        # 没有同步进程时直接 wait
+        wait -n 2>/dev/null && warn "某个服务已退出，按 Ctrl+C 停止全部" && wait || wait
+    fi
+}
+
+# ═══════════════════════════════════════════════════════
+# 实时状态面板 — 每 5 秒刷新
+# ═══════════════════════════════════════════════════════
+
+format_countdown() {
+    local secs=$1
+    if [[ $secs -le 0 ]]; then
+        echo "即将开始"
+    elif [[ $secs -lt 60 ]]; then
+        echo "${secs}s"
+    else
+        echo "$((secs / 60))m $((secs % 60))s"
+    fi
+}
+
+format_time() {
+    # ISO 8601 → local HH:MM:SS
+    local iso=$1
+    if [[ -z "$iso" || "$iso" == "null" ]]; then
+        echo "--:--:--"
+        return
+    fi
+    # macOS date vs GNU date
+    if date -j -f "%Y-%m-%dT%H:%M:%S" "$(echo "$iso" | cut -c1-19)" "+%H:%M:%S" 2>/dev/null; then
+        return
+    fi
+    date -d "$iso" "+%H:%M:%S" 2>/dev/null || echo "${iso:11:8}"
+}
+
+read_status_json() {
+    local file=$1
+    if [[ -f "$file" ]]; then
+        cat "$file" 2>/dev/null
+    else
+        echo '{}'
+    fi
+}
+
+json_val() {
+    # Minimal JSON value extractor (no jq dependency)
+    local json=$1 key=$2
+    echo "$json" | sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^,\"}\n]*\)\"\{0,1\}.*/\1/p" | head -1
+}
+
+render_sync_line() {
+    local label=$1 json=$2
+    local status last_sync duration next_sync countdown_str
+    status=$(json_val "$json" "status")
+    last_sync=$(json_val "$json" "lastSync")
+    duration=$(json_val "$json" "durationSec")
+    next_sync=$(json_val "$json" "nextSync")
+
+    local last_time
+    last_time=$(format_time "$last_sync")
+
+    # Calculate countdown to next sync
+    local countdown=""
+    if [[ -n "$next_sync" && "$next_sync" != "null" ]]; then
+        local next_epoch now_epoch
+        # macOS
+        next_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%S" "$(echo "$next_sync" | cut -c1-19)" "+%s" 2>/dev/null)
+        if [[ -z "$next_epoch" ]]; then
+            # GNU/Linux
+            next_epoch=$(date -d "$next_sync" "+%s" 2>/dev/null)
+        fi
+        now_epoch=$(date "+%s")
+        if [[ -n "$next_epoch" ]]; then
+            local diff=$(( next_epoch - now_epoch ))
+            countdown=$(format_countdown "$diff")
+        fi
+    fi
+
+    # Status icon
+    local icon
+    case "$status" in
+        ok)      icon="${GREEN}✓${NC}" ;;
+        syncing) icon="${YELLOW}⟳${NC}" ;;
+        error)   icon="${RED}✗${NC}" ;;
+        *)       icon="${YELLOW}…${NC}" ;;
+    esac
+
+    if [[ "$status" == "syncing" ]]; then
+        printf "  %b %-18s ${YELLOW}同步中...${NC}\n" "$icon" "$label"
+    elif [[ -n "$last_sync" && "$last_sync" != "null" ]]; then
+        printf "  %b %-18s 上次: %s (%ss)" "$icon" "$label" "$last_time" "$duration"
+        if [[ -n "$countdown" ]]; then
+            printf "  下次: %s" "$countdown"
+        fi
+        echo ""
+    else
+        printf "  %b %-18s ${YELLOW}等待首次同步...${NC}\n" "$icon" "$label"
+    fi
+}
+
+render_sync_detail() {
+    local json=$1 type=$2
+    local status
+    status=$(json_val "$json" "status")
+
+    if [[ "$type" == "polymarket" && "$status" == "ok" ]]; then
+        local events markets settled
+        events=$(json_val "$json" "events")
+        markets=$(json_val "$json" "markets")
+        settled=$(json_val "$json" "settled")
+        printf "                       事件: %s  市场: %s" "${events:-0}" "${markets:-0}"
+        [[ "${settled:-0}" != "0" ]] && printf "  结算: %s" "$settled"
+        echo ""
+    elif [[ "$type" == "prices" && "$status" == "ok" ]]; then
+        local updated failed total
+        updated=$(json_val "$json" "updated")
+        failed=$(json_val "$json" "failed")
+        total=$(json_val "$json" "totalMarkets")
+        printf "                       更新: %s/%s" "${updated:-0}" "${total:-0}"
+        [[ "${failed:-0}" != "0" ]] && printf "  ${RED}失败: %s${NC}" "$failed"
+        echo ""
+    elif [[ "$status" == "error" ]]; then
+        local error_msg
+        error_msg=$(json_val "$json" "error")
+        printf "                       ${RED}错误: %s${NC}\n" "${error_msg:0:60}"
+    fi
+}
+
+status_dashboard() {
+    local REFRESH_SEC=5
+
+    while true; do
+        # Check if child processes are still alive
+        local api_alive=false web_alive=false
+        [[ -f "$PID_DIR/api.pid" ]] && kill -0 "$(cat "$PID_DIR/api.pid")" 2>/dev/null && api_alive=true
+        [[ -f "$PID_DIR/web.pid" ]] && kill -0 "$(cat "$PID_DIR/web.pid")" 2>/dev/null && web_alive=true
+
+        if [[ "$api_alive" == false && "$web_alive" == false ]]; then
+            warn "所有核心服务已退出"
+            break
+        fi
+
+        # Read status files
+        local poly_json prices_json
+        poly_json=$(read_status_json "$PID_DIR/polymarket_status.json")
+        prices_json=$(read_status_json "$PID_DIR/prices_status.json")
+
+        # Render
+        echo -e "\033[2J\033[H"  # clear screen
+        echo ""
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║              FinMolt 服务运行状态                        ║${NC}"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+
+        # Services
+        echo -e " ${CYAN}服务${NC}"
+        if [[ "$api_alive" == true ]]; then
+            echo -e "  ${GREEN}✓${NC} API               http://localhost:$API_PORT"
+        else
+            echo -e "  ${RED}✗${NC} API               ${RED}已停止${NC}"
+        fi
+        if [[ "$web_alive" == true ]]; then
+            echo -e "  ${GREEN}✓${NC} Web               http://localhost:$WEB_PORT"
+        else
+            echo -e "  ${RED}✗${NC} Web               ${RED}已停止${NC}"
+        fi
+
+        local agent_alive=false
+        if [[ -f "$PID_DIR/agent.pid" ]] && kill -0 "$(cat "$PID_DIR/agent.pid")" 2>/dev/null; then
+            agent_alive=true
+        fi
+        if [[ "$agent_alive" == true ]]; then
+            echo -e "  ${GREEN}✓${NC} Agent Bot         运行中"
+        elif [[ "$SKIP_AGENT" == false && -d "$AGENT_DIR" ]]; then
+            echo -e "  ${YELLOW}–${NC} Agent Bot         未启动"
+        fi
+
+        echo ""
+        echo -e " ${CYAN}数据同步${NC}"
+        render_sync_line "Polymarket 市场" "$poly_json"
+        render_sync_detail "$poly_json" "polymarket"
+        render_sync_line "CLOB 实时价格" "$prices_json"
+        render_sync_detail "$prices_json" "prices"
+
+        echo ""
+        echo -e " ${CYAN}日志${NC}"
+        echo "  API:        tail -f $PID_DIR/api.log"
+        echo "  Polymarket: tail -f $PID_DIR/polymarket.log"
+        echo "  Prices:     tail -f $PID_DIR/prices.log"
+
+        echo ""
+        echo -e "  刷新间隔: ${REFRESH_SEC}s | 按 ${YELLOW}Ctrl+C${NC} 停止所有服务"
+        echo -e "${CYAN}──────────────────────────────────────────────────────────${NC}"
+
+        sleep $REFRESH_SEC
+    done
 }
 
 main "$@"

@@ -9,7 +9,10 @@
 //   node scripts/sync_prices.js --watch    # repeat every PRICES_SYNC_INTERVAL_MS (default 2 min)
 
 require('dotenv').config();
+const fs = require('fs');
 const { Pool } = require('pg');
+
+const STATUS_FILE = process.env.SYNC_STATUS_FILE || null;
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
@@ -73,9 +76,17 @@ async function mapConcurrent(items, limit, fn) {
 // Main sync
 // ---------------------------------------------------------------------------
 
+function writeStatus(data) {
+    if (!STATUS_FILE) return;
+    try {
+        fs.writeFileSync(STATUS_FILE, JSON.stringify(data) + '\n');
+    } catch { /* ignore */ }
+}
+
 async function sync() {
     const start = Date.now();
     console.log(`[${new Date().toISOString()}] Starting CLOB price sync…`);
+    writeStatus({ status: 'syncing', startedAt: new Date().toISOString(), intervalMs: SYNC_INTERVAL_MS });
 
     // Fetch active markets that have CLOB token IDs.
     // Limit to PRICES_MAX_MARKETS (default 500) most recently fetched markets
@@ -96,6 +107,11 @@ async function sync() {
 
     if (markets.length === 0) {
         console.log('No active markets with CLOB token IDs found. Run polymarket:sync first.');
+        writeStatus({
+            status: 'ok', lastSync: new Date().toISOString(), durationSec: '0',
+            updated: 0, failed: 0, totalMarkets: 0,
+            intervalMs: SYNC_INTERVAL_MS, nextSync: new Date(Date.now() + SYNC_INTERVAL_MS).toISOString(),
+        });
         return;
     }
 
@@ -152,12 +168,24 @@ async function sync() {
     } catch (err) {
         await client.query('ROLLBACK').catch(() => {});
         console.error('DB update failed:', err.message);
+        writeStatus({
+            status: 'error', error: err.message,
+            lastSync: new Date().toISOString(), durationSec: ((Date.now() - start) / 1000).toFixed(1),
+            updated: 0, failed: 0, totalMarkets: markets.length,
+            intervalMs: SYNC_INTERVAL_MS, nextSync: new Date(Date.now() + SYNC_INTERVAL_MS).toISOString(),
+        });
     } finally {
         client.release();
     }
 
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
     console.log(`Done. ${updated} updated, ${failed} failed in ${elapsed}s`);
+    writeStatus({
+        status: failed > 0 && updated === 0 ? 'error' : 'ok',
+        lastSync: new Date().toISOString(), durationSec: elapsed,
+        updated, failed, totalMarkets: markets.length,
+        intervalMs: SYNC_INTERVAL_MS, nextSync: new Date(Date.now() + SYNC_INTERVAL_MS).toISOString(),
+    });
 }
 
 // ---------------------------------------------------------------------------
