@@ -12,8 +12,14 @@
  */
 
 import config from './config.js';
+import { readFileSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { FinMoltClient } from './lib/finmolt-client.js';
 import { AgentBrain } from './lib/agent-brain.js';
+import { getToolSchemas, buildToolMap } from './lib/tools.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 class FinMoltBot {
   constructor() {
@@ -66,6 +72,7 @@ class FinMoltBot {
     this.brain = new AgentBrain({
       provider: config.llm.provider,
       apiKey: config.llm.provider === 'openai' ? config.llm.openaiApiKey : config.llm.anthropicApiKey,
+      anthropicBaseUrl: config.llm.anthropicBaseUrl,
       openaiModel: config.llm.openaiModel,
       persona: {
         name: this.me.displayName || this.me.name,
@@ -74,6 +81,9 @@ class FinMoltBot {
         interests: ['macro economics', 'interest rates', 'equities', 'crypto', 'quantitative analysis'],
       },
     });
+
+    // Auto-detect best available model
+    await this.brain.init();
 
     // Subscribe to all channels on first run
     await this.subscribeToChannels();
@@ -106,7 +116,7 @@ class FinMoltBot {
   async heartbeat() {
     this.heartbeatCount++;
     this.log(`\n${'='.repeat(50)}`);
-    this.log(`Heartbeat #${this.heartbeatCount}`);
+    this.log(`Heartbeat #${this.heartbeatCount} [mode: ${config.agent.mode}]`);
     this.log(`${'='.repeat(50)}`);
 
     // Reset daily post counter
@@ -116,6 +126,40 @@ class FinMoltBot {
       this.lastPostDate = today;
     }
 
+    if (config.agent.mode === 'tool-use') {
+      await this.heartbeatToolUse();
+    } else {
+      await this.heartbeatLegacy();
+    }
+  }
+
+  async heartbeatToolUse() {
+    try {
+      // Load skill.md
+      const skillPath = join(__dirname, 'skill.md');
+      const skillContent = readFileSync(skillPath, 'utf-8');
+
+      const toolSchemas = getToolSchemas();
+      const toolMap = buildToolMap();
+
+      this.log(`Running autonomous cycle (max ${config.agent.maxIterations} iterations, ${toolSchemas.length} tools)...`);
+
+      const actions = await this.brain.runAutonomous(
+        this.client,
+        toolMap,
+        toolSchemas,
+        skillContent,
+        config.agent.maxIterations,
+        (msg) => this.log(msg),
+      );
+
+      this.log(`Heartbeat #${this.heartbeatCount} complete — ${actions.length} tool calls`);
+    } catch (err) {
+      this.log(`Heartbeat error: ${err.message}`);
+    }
+  }
+
+  async heartbeatLegacy() {
     try {
       // Step 1: Browse and evaluate posts
       const posts = await this.browsePosts();

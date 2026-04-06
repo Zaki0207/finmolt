@@ -6,14 +6,17 @@ import OpenAI from 'openai';
  * Supports both Anthropic (Claude) and OpenAI (GPT) via LLM_PROVIDER env var.
  */
 export class AgentBrain {
-  constructor({ apiKey, persona, provider = 'anthropic', openaiModel = 'gpt-4o' }) {
+  constructor({ apiKey, persona, provider = 'anthropic', openaiModel = 'gpt-4o', anthropicBaseUrl, anthropicModel }) {
     this.provider = provider;
     this.openaiModel = openaiModel;
+    this.anthropicModel = anthropicModel || null; // resolved in init()
 
     if (provider === 'openai') {
       this.client = new OpenAI({ apiKey });
     } else {
-      this.client = new Anthropic({ apiKey });
+      const opts = { apiKey };
+      if (anthropicBaseUrl) opts.baseURL = anthropicBaseUrl;
+      this.client = new Anthropic(opts);
     }
 
     this.persona = persona || {
@@ -23,6 +26,70 @@ export class AgentBrain {
       interests: ['macro economics', 'interest rates', 'equities', 'crypto trends'],
     };
     this.systemPrompt = this._buildSystemPrompt();
+  }
+
+  /**
+   * Auto-detect the best available model by querying the API.
+   * Call once after construction. Falls back to a safe default if detection fails.
+   */
+  async init() {
+    if (this.provider !== 'anthropic' || this.anthropicModel) return;
+
+    // Preference order: best to worst
+    const preferred = [
+      'claude-sonnet-4-6',
+      'claude-sonnet-4-20250514',
+    ];
+
+    try {
+      const res = await this.client.models.list({ limit: 100 });
+      const available = new Set();
+      // The SDK returns an async iterable or object with .data
+      const items = res?.data ?? res;
+      if (items && Symbol.asyncIterator in items) {
+        for await (const m of items) available.add(m.id);
+      } else if (Array.isArray(items)) {
+        for (const m of items) available.add(m.id);
+      }
+
+      if (available.size > 0) {
+        const picked = preferred.find(m => available.has(m));
+        if (picked) {
+          this.anthropicModel = picked;
+          console.log(`[Brain] Auto-detected model: ${picked} (from ${available.size} available)`);
+          return;
+        }
+        // None of our preferred matched — pick the first claude model
+        for (const id of available) {
+          if (id.startsWith('claude')) {
+            this.anthropicModel = id;
+            console.log(`[Brain] Auto-detected model: ${id} (fallback from ${available.size} available)`);
+            return;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[Brain] Model detection failed (${err.message}), trying fallback...`);
+    }
+
+    // Fallback: try a cheap test call to see which model works
+    for (const model of preferred) {
+      try {
+        await this.client.messages.create({
+          model,
+          max_tokens: 1,
+          messages: [{ role: 'user', content: 'hi' }],
+        });
+        this.anthropicModel = model;
+        console.log(`[Brain] Model probe succeeded: ${model}`);
+        return;
+      } catch {
+        // try next
+      }
+    }
+
+    this.anthropicModel = 'claude-sonnet-4-6';
+    console.warn(`[Brain] All probes failed, defaulting to ${this.anthropicModel}`);
   }
 
   _buildSystemPrompt() {
@@ -59,7 +126,7 @@ Rules:
       return response.choices[0].message.content.trim();
     } else {
       const response = await this.client.messages.create({
-        model: 'claude-sonnet-4-6',
+        model: this.anthropicModel,
         max_tokens: maxTokens,
         system: this.systemPrompt,
         messages: [{ role: 'user', content: userContent }],
@@ -386,5 +453,195 @@ Otherwise respond with just: NO_POST`, 1024);
       return null;
     }
     return result;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Autonomous tool-use mode
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Run an autonomous agentic loop.
+   * The LLM reads skill.md, decides which tools to call, executes them, and
+   * continues until it signals end_turn or maxIterations is reached.
+   *
+   * @param {Object} client - FinMoltClient instance
+   * @param {Object} toolMap - name → { execute } from buildToolMap()
+   * @param {Array} toolSchemas - tool definitions for LLM from getToolSchemas()
+   * @param {string} skillContent - contents of skill.md
+   * @param {number} maxIterations - safety cap on tool-use rounds
+   * @param {function} log - logging function
+   * @returns {Promise<string[]>} list of action summaries
+   */
+  async runAutonomous(client, toolMap, toolSchemas, skillContent, maxIterations = 20, log = console.log) {
+    const actions = [];
+
+    const systemPrompt = `${this.systemPrompt}
+
+You are operating autonomously on the Moltbook platform. Each heartbeat cycle, you should:
+1. Browse the forum and engage with interesting posts (upvote, comment)
+2. Browse prediction markets and check your portfolio
+3. Make data-driven trades when you see opportunities
+4. Optionally share analysis posts about your market views
+
+Below is the full API reference (skill sheet) for all available tools:
+
+---
+${skillContent}
+---
+
+Guidelines:
+- Be strategic. Don't trade just for activity — only when you see genuine edge.
+- Keep each trade under 15% of your available balance.
+- Check your portfolio and trade history before buying to avoid over-concentration.
+- Check price history trends before entering a position.
+- Write substantive comments, not filler.
+- Don't upvote/comment on your own posts.
+- When done with this cycle, output a brief summary of what you did and why.`;
+
+    const messages = [
+      { role: 'user', content: 'Begin your heartbeat cycle. Browse the forum and markets, then decide what actions to take.' },
+    ];
+
+    for (let iteration = 0; iteration < maxIterations; iteration++) {
+      let response;
+
+      try {
+        if (this.provider === 'openai') {
+          response = await this._openaiToolLoop(messages, toolSchemas, systemPrompt);
+        } else {
+          response = await this._anthropicToolLoop(messages, toolSchemas, systemPrompt);
+        }
+      } catch (err) {
+        log(`  [brain] LLM call failed: ${err.message}`);
+        break;
+      }
+
+      // No tool calls — LLM is done
+      if (!response.toolCalls || response.toolCalls.length === 0) {
+        if (response.text) {
+          log(`  [brain] ${response.text.slice(0, 200)}`);
+        }
+        break;
+      }
+
+      // Execute tool calls
+      const toolResults = [];
+
+      for (const call of response.toolCalls) {
+        const tool = toolMap[call.name];
+        if (!tool) {
+          log(`  [tool] UNKNOWN: ${call.name}`);
+          toolResults.push({ id: call.id, error: `Unknown tool: ${call.name}` });
+          actions.push(`[error] unknown tool: ${call.name}`);
+          continue;
+        }
+
+        try {
+          const result = await tool.execute(client, call.input || {});
+          const resultStr = JSON.stringify(result);
+          const truncated = resultStr.length > 4000 ? resultStr.slice(0, 4000) + '...(truncated)' : resultStr;
+          log(`  [tool] ${call.name}(${JSON.stringify(call.input).slice(0, 100)}) → ${resultStr.slice(0, 120)}`);
+          toolResults.push({ id: call.id, content: truncated });
+          actions.push(`${call.name}(${JSON.stringify(call.input).slice(0, 80)})`);
+        } catch (err) {
+          log(`  [tool] ${call.name} ERROR: ${err.message}`);
+          toolResults.push({ id: call.id, error: err.message });
+          actions.push(`[error] ${call.name}: ${err.message}`);
+        }
+      }
+
+      // Feed results back to the LLM
+      if (this.provider === 'openai') {
+        // OpenAI: assistant message with tool_calls, then tool results
+        messages.push(response.rawAssistantMessage);
+        for (const tr of toolResults) {
+          messages.push({
+            role: 'tool',
+            tool_call_id: tr.id,
+            content: tr.error ? `Error: ${tr.error}` : tr.content,
+          });
+        }
+      } else {
+        // Anthropic: assistant content blocks, then user with tool_result blocks
+        messages.push({ role: 'assistant', content: response.rawContent });
+        messages.push({
+          role: 'user',
+          content: toolResults.map(tr => ({
+            type: 'tool_result',
+            tool_use_id: tr.id,
+            ...(tr.error
+              ? { is_error: true, content: tr.error }
+              : { content: tr.content }),
+          })),
+        });
+      }
+    }
+
+    return actions;
+  }
+
+  /**
+   * Anthropic tool-use call. Returns parsed response with tool calls.
+   */
+  async _anthropicToolLoop(messages, toolSchemas, systemPrompt) {
+    const response = await this.client.messages.create({
+      model: this.anthropicModel,
+      max_tokens: 4096,
+      system: systemPrompt,
+      tools: toolSchemas,
+      messages,
+    });
+
+    const textBlocks = response.content.filter(b => b.type === 'text');
+    const toolBlocks = response.content.filter(b => b.type === 'tool_use');
+
+    return {
+      text: textBlocks.map(b => b.text).join('\n').trim(),
+      toolCalls: toolBlocks.map(b => ({ id: b.id, name: b.name, input: b.input })),
+      rawContent: response.content,
+      stopReason: response.stop_reason,
+    };
+  }
+
+  /**
+   * OpenAI tool-use call. Returns parsed response with tool calls.
+   */
+  async _openaiToolLoop(messages, toolSchemas, systemPrompt) {
+    // Convert Anthropic tool format to OpenAI tools format
+    const tools = toolSchemas.map(t => ({
+      type: 'function',
+      function: {
+        name: t.name,
+        description: t.description,
+        parameters: t.input_schema,
+      },
+    }));
+
+    const openaiMessages = [
+      { role: 'system', content: systemPrompt },
+      ...messages,
+    ];
+
+    const response = await this.client.chat.completions.create({
+      model: this.openaiModel,
+      max_tokens: 4096,
+      tools,
+      tool_choice: 'auto',
+      messages: openaiMessages,
+    });
+
+    const message = response.choices[0].message;
+    const toolCalls = (message.tool_calls || []).map(tc => ({
+      id: tc.id,
+      name: tc.function.name,
+      input: JSON.parse(tc.function.arguments),
+    }));
+
+    return {
+      text: message.content?.trim() || '',
+      toolCalls,
+      rawAssistantMessage: message,
+      stopReason: response.choices[0].finish_reason,
+    };
   }
 }

@@ -24,7 +24,8 @@ const config = {
   },
   llm: {
     provider: process.env.LLM_PROVIDER || 'anthropic', // 'anthropic' or 'openai'
-    anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
+    anthropicApiKey: process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || null,
+    anthropicBaseUrl: process.env.ANTHROPIC_BASE_URL || null,
     openaiApiKey: process.env.OPENAI_API_KEY || null,
     openaiModel: process.env.OPENAI_MODEL || 'gpt-4o',
   },
@@ -39,6 +40,10 @@ const config = {
     maxTradesPerHeartbeat: parseInt(process.env.MAX_TRADES_PER_HEARTBEAT || '2', 10),
     maxPositionSize: parseInt(process.env.MAX_POSITION_SIZE || '100', 10),
     postAboutTrades: process.env.POST_ABOUT_TRADES !== 'false',
+  },
+  agent: {
+    mode: process.env.AGENT_MODE || 'tool-use',   // 'tool-use' | 'legacy'
+    maxIterations: parseInt(process.env.MAX_ITERATIONS || '20', 10),
   },
   credentialsPath: CREDENTIALS_PATH,
 };
