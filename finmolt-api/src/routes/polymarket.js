@@ -4,6 +4,11 @@ const db = require('../config/db');
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+function parseOutcomes(raw) {
+    if (Array.isArray(raw)) return raw;
+    try { return JSON.parse(raw); } catch { return []; }
+}
+
 function formatMarket(m) {
     return {
         id: m.id,
@@ -11,7 +16,8 @@ function formatMarket(m) {
         slug: m.slug,
         description: m.description || null,
         image: m.image || null,
-        outcomes: m.outcomes,          // ::text cast → JSON string for frontend parseOutcomes
+        // Always return outcomes as an array (Issue #17: type consistency)
+        outcomes: parseOutcomes(m.outcomes),
         groupItemTitle: m.group_item_title,
         negRisk: m.neg_risk,
         active: m.active,
@@ -26,7 +32,7 @@ function formatMarket(m) {
         bestAsk:        m.best_ask         != null ? parseFloat(m.best_ask)        : null,
         lastPrice:      m.last_price       != null ? parseFloat(m.last_price)      : null,
         priceUpdatedAt: m.price_updated_at || null,
-        volume:         m.volume          != null ? parseFloat(m.volume)          : null,
+        volume:         m.volume           != null ? parseFloat(m.volume)          : null,
     };
 }
 
@@ -39,7 +45,7 @@ function formatEvent(e, markets) {
         image: e.image || null,
         icon: e.icon || null,
         negRisk: e.neg_risk,
-        tags: e._tags || [],           // populated from junction table
+        tags: e._tags || [],
         active: e.active,
         closed: e.closed,
         startDate: e.start_date,
@@ -49,6 +55,11 @@ function formatEvent(e, markets) {
 }
 
 // ── GET /polymarket/events ────────────────────────────────────────────────────
+// Query params:
+//   status  = active (default) | closed | settled | all
+//   tag_id  = filter by tag
+//   search  = full-text search
+//   limit, offset
 
 router.get('/events', async (req, res, next) => {
     try {
@@ -56,10 +67,31 @@ router.get('/events', async (req, res, next) => {
         const offset = parseInt(req.query.offset) || 0;
         const tagId  = req.query.tag_id;
         const search = req.query.search;
+        const status = req.query.status || 'active';
 
         const params = [];
-        const conditions = ['e.active = true', 'e.closed = false'];
+        const conditions = [];
         let joinClause = '';
+
+        // Status filter (Issue #15: allow viewing closed/settled markets)
+        switch (status) {
+            case 'closed':
+                conditions.push('e.closed = true');
+                break;
+            case 'settled':
+                // Events where at least one market has a resolved_outcome
+                conditions.push('e.closed = true');
+                conditions.push(`EXISTS (
+                    SELECT 1 FROM polymarket_markets pm2
+                    WHERE pm2.event_id = e.id AND pm2.resolved_outcome IS NOT NULL
+                )`);
+                break;
+            case 'all':
+                // No status filter
+                break;
+            default: // 'active'
+                conditions.push('e.active = true', 'e.closed = false');
+        }
 
         // Tag filter via junction table
         if (tagId) {
@@ -67,7 +99,7 @@ router.get('/events', async (req, res, next) => {
             joinClause = `JOIN polymarket_event_tags et ON et.event_id = e.id AND et.tag_id = $${params.length}`;
         }
 
-        // Full-text search on events + markets
+        // Full-text search
         if (search) {
             params.push(search);
             const p = params.length;
@@ -80,10 +112,19 @@ router.get('/events', async (req, res, next) => {
             )`);
         }
 
-        const where = 'WHERE ' + conditions.join(' AND ');
+        const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
 
-        // Fetch limit+1 for hasMore detection (project convention)
-        params.push(limit + 1, offset);
+        // Count query for correct pagination total (Issue #16)
+        const countParams = params.slice(); // copy before adding limit/offset
+        const { rows: countRows } = await db.query(`
+            SELECT COUNT(DISTINCT e.id)::int AS total
+            FROM polymarket_events e
+            ${joinClause}
+            ${where}
+        `, countParams);
+        const total = countRows[0].total;
+
+        params.push(limit, offset);
         const limitIdx  = params.length - 1;
         const offsetIdx = params.length;
 
@@ -97,10 +138,7 @@ router.get('/events', async (req, res, next) => {
             LIMIT $${limitIdx} OFFSET $${offsetIdx}
         `, params);
 
-        const hasMore = events.length > limit;
-        const data = hasMore ? events.slice(0, limit) : events;
-
-        if (data.length === 0) {
+        if (events.length === 0) {
             return res.json({
                 data: [],
                 pagination: { total: 0, limit, offset, hasMore: false },
@@ -108,7 +146,7 @@ router.get('/events', async (req, res, next) => {
         }
 
         // Fetch markets for returned events
-        const eventIds = data.map(e => e.id);
+        const eventIds = events.map(e => e.id);
         const { rows: markets } = await db.query(`
             SELECT id, event_id, question, slug, description, image,
                    outcomes::text AS outcomes, clob_token_ids,
@@ -120,7 +158,7 @@ router.get('/events', async (req, res, next) => {
             ORDER BY created_at ASC
         `, [eventIds]);
 
-        // Fetch tags for returned events via junction table
+        // Fetch tags for returned events
         const { rows: tagRows } = await db.query(`
             SELECT et.event_id, t.id, t.label, t.slug
             FROM polymarket_event_tags et
@@ -139,15 +177,13 @@ router.get('/events', async (req, res, next) => {
                 id: r.id, label: r.label, slug: r.slug,
             });
         }
-
-        // Attach tags to events
-        for (const e of data) {
+        for (const e of events) {
             e._tags = tagsByEvent[e.id] || [];
         }
 
         res.json({
-            data: data.map(e => formatEvent(e, marketsByEvent[e.id] || [])),
-            pagination: { total: data.length, limit, offset, hasMore },
+            data: events.map(e => formatEvent(e, marketsByEvent[e.id] || [])),
+            pagination: { total, limit, offset, hasMore: offset + events.length < total },
         });
     } catch (err) { next(err); }
 });
@@ -167,7 +203,6 @@ router.get('/events/:slug', async (req, res, next) => {
 
         const event = rows[0];
 
-        // Fetch markets
         const { rows: markets } = await db.query(`
             SELECT id, event_id, question, slug, description, image,
                    outcomes::text AS outcomes, clob_token_ids,
@@ -179,7 +214,6 @@ router.get('/events/:slug', async (req, res, next) => {
             ORDER BY created_at ASC
         `, [event.id]);
 
-        // Fetch tags
         const { rows: tagRows } = await db.query(`
             SELECT t.id, t.label, t.slug
             FROM polymarket_event_tags et
@@ -240,6 +274,60 @@ router.get('/tags', async (req, res, next) => {
         `, [limit]);
 
         res.json(rows);
+    } catch (err) { next(err); }
+});
+
+// ── GET /polymarket/health ────────────────────────────────────────────────────
+// Issue #24: detailed health check endpoint for monitoring
+
+router.get('/health', async (req, res, next) => {
+    try {
+        // DB connectivity check
+        const { rows: dbRows } = await db.query('SELECT 1');
+        const dbOk = dbRows.length > 0;
+
+        // Market counts
+        const { rows: countRows } = await db.query(`
+            SELECT
+                COUNT(*) FILTER (WHERE active = true AND closed = false)  AS active_markets,
+                COUNT(*) FILTER (WHERE closed = true)                     AS closed_markets,
+                COUNT(*)                                                   AS total_markets
+            FROM polymarket_markets
+        `);
+        const counts = countRows[0];
+
+        // Last sync time
+        const { rows: syncRows } = await db.query(`
+            SELECT MAX(fetched_at) AS last_sync
+            FROM polymarket_events
+        `);
+        const lastSync = syncRows[0]?.last_sync || null;
+
+        // Stale price check (active markets with prices > 30 min old)
+        const { rows: staleRows } = await db.query(`
+            SELECT COUNT(*) AS stale_count
+            FROM polymarket_markets
+            WHERE active = true AND closed = false
+              AND neg_risk = false
+              AND clob_token_ids != '[]'::jsonb
+              AND clob_token_ids IS NOT NULL
+              AND (price_updated_at IS NULL OR price_updated_at < NOW() - INTERVAL '30 minutes')
+        `);
+        const staleCount = parseInt(staleRows[0].stale_count);
+
+        const status = !dbOk ? 'error'
+            : staleCount > 50 ? 'degraded'
+            : 'ok';
+
+        res.json({
+            status,
+            db: dbOk,
+            lastSync,
+            activeMarkets:  parseInt(counts.active_markets),
+            closedMarkets:  parseInt(counts.closed_markets),
+            totalMarkets:   parseInt(counts.total_markets),
+            stalePriceCount: staleCount,
+        });
     } catch (err) { next(err); }
 });
 

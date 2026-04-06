@@ -17,8 +17,38 @@ const STATUS_FILE = process.env.SYNC_STATUS_FILE || null;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 const CLOB_BASE          = 'https://clob.polymarket.com';
+const GAMMA_BASE         = 'https://gamma-api.polymarket.com';
 const SYNC_INTERVAL_MS   = Number(process.env.PRICES_SYNC_INTERVAL_MS) || 2 * 60 * 1000;
 const CONCURRENCY        = 20;   // max parallel CLOB requests per batch
+
+// ---------------------------------------------------------------------------
+// Retry-aware fetch helper
+// ---------------------------------------------------------------------------
+
+async function fetchWithRetry(url, { maxRetries = 3, signal } = {}) {
+    let lastError;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            const res = await fetch(url, signal ? { signal } : {});
+            if (res.status === 429 || res.status >= 500) {
+                lastError = new Error(`HTTP ${res.status}`);
+                const backoff = Math.min(1000 * Math.pow(2, attempt), 30_000);
+                await new Promise(r => setTimeout(r, backoff));
+                continue;
+            }
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return res;
+        } catch (err) {
+            if (err.name === 'AbortError') throw err;
+            lastError = err;
+            if (attempt < maxRetries - 1) {
+                const backoff = Math.min(1000 * Math.pow(2, attempt), 30_000);
+                await new Promise(r => setTimeout(r, backoff));
+            }
+        }
+    }
+    throw lastError;
+}
 
 // ---------------------------------------------------------------------------
 // CLOB helpers
@@ -26,8 +56,7 @@ const CONCURRENCY        = 20;   // max parallel CLOB requests per batch
 
 async function fetchBook(tokenId) {
     const url = `${CLOB_BASE}/book?token_id=${encodeURIComponent(tokenId)}`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`CLOB HTTP ${res.status} for token ${tokenId}`);
+    const res = await fetchWithRetry(url);
     return res.json();
 }
 
@@ -35,14 +64,13 @@ function extractBidAsk(book) {
     const bids = Array.isArray(book?.bids) ? book.bids : [];
     const asks = Array.isArray(book?.asks) ? book.asks : [];
 
-    // bids are sorted desc, asks asc — first entry is best
     const bestBid = bids.length > 0 ? parseFloat(bids[0].price) : null;
     const bestAsk = asks.length > 0 ? parseFloat(asks[0].price) : null;
 
-    // mid-price as last_price fallback when no trade history is available.
-    // If spread >= 0.9 the order book is empty/illiquid (e.g. negRisk markets
-    // where ask=1.0, bid=0). In that case, keep lastPrice null so we don't
-    // overwrite the correct Gamma API price from sync_polymarket.
+    // mid-price as last_price fallback.
+    // If spread >= 0.9, the order book is illiquid (e.g. negRisk markets
+    // where ask=1.0, bid=0). Keep lastPrice null so we can fall back to
+    // Gamma API price.
     let lastPrice = null;
     if (bestBid !== null && bestAsk !== null) {
         const spread = bestAsk - bestBid;
@@ -56,6 +84,31 @@ function extractBidAsk(book) {
     }
 
     return { bestBid, bestAsk, lastPrice };
+}
+
+/**
+ * Fetch YES price for a negRisk market from the Gamma API as fallback.
+ * negRisk markets often return illiquid CLOB books (spread ≥ 0.9),
+ * but the Gamma API's outcomePrices[0] contains a usable price.
+ */
+async function fetchNegRiskPriceFromGamma(marketId) {
+    try {
+        const res = await fetchWithRetry(`${GAMMA_BASE}/markets/${marketId}`);
+        const m = await res.json();
+        if (!m.outcomePrices) return null;
+        const arr = Array.isArray(m.outcomePrices) ? m.outcomePrices : JSON.parse(m.outcomePrices);
+        const price = parseFloat(arr[0]);
+        if (!isFinite(price)) return null;
+        // Skip Polymarket's 0.5 placeholder for markets with no real order book
+        if (price === 0.5 && m.bestAsk == null && m.bestBid == null) return null;
+        return {
+            bestBid:   m.bestBid  != null ? parseFloat(m.bestBid)  : null,
+            bestAsk:   m.bestAsk  != null ? parseFloat(m.bestAsk)  : null,
+            lastPrice: price,
+        };
+    } catch {
+        return null;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -88,17 +141,14 @@ async function sync() {
     console.log(`[${new Date().toISOString()}] Starting CLOB price sync…`);
     writeStatus({ status: 'syncing', startedAt: new Date().toISOString(), intervalMs: SYNC_INTERVAL_MS });
 
-    // Fetch active markets that have CLOB token IDs.
-    // Limit to PRICES_MAX_MARKETS (default 500) most recently fetched markets
-    // to keep each sync cycle fast and avoid rate-limiting.
     const maxMarkets = Number(process.env.PRICES_MAX_MARKETS) || 500;
 
+    // Fetch all active markets (including negRisk — we handle them separately below)
     const { rows: markets } = await pool.query(`
-        SELECT id, clob_token_ids
+        SELECT id, neg_risk, clob_token_ids
         FROM polymarket_markets
         WHERE active = true
           AND closed = false
-          AND neg_risk = false
           AND clob_token_ids != '[]'::jsonb
           AND clob_token_ids IS NOT NULL
         ORDER BY fetched_at DESC
@@ -119,12 +169,17 @@ async function sync() {
 
     let updated = 0;
     let failed  = 0;
+    let negRiskFallbacks = 0;
     const now   = new Date();
 
-    // Build (marketId, tokenId) pairs — use index 0 (YES token) for the book
-    const tasks = markets.map(m => {
+    // Separate negRisk from standard markets
+    const standardMarkets = markets.filter(m => !m.neg_risk);
+    const negRiskMarkets  = markets.filter(m =>  m.neg_risk);
+
+    // ── Standard markets: CLOB order book ─────────────────────────────────────
+    const tasks = standardMarkets.map(m => {
         const tokenIds = Array.isArray(m.clob_token_ids) ? m.clob_token_ids : [];
-        return { marketId: m.id, tokenId: tokenIds[0] || null };
+        return { marketId: m.id, tokenId: tokenIds[0] || null, negRisk: false };
     }).filter(t => t.tokenId);
 
     const results = await mapConcurrent(tasks, CONCURRENCY, async ({ marketId, tokenId }) => {
@@ -132,21 +187,46 @@ async function sync() {
         return { marketId, ...extractBidAsk(book) };
     });
 
-    // Batch update DB
+    // ── negRisk markets: CLOB first, Gamma API fallback ───────────────────────
+    const negRiskTasks = negRiskMarkets.map(m => {
+        const tokenIds = Array.isArray(m.clob_token_ids) ? m.clob_token_ids : [];
+        return { marketId: m.id, tokenId: tokenIds[0] || null, negRisk: true };
+    });
+
+    const negRiskResults = await mapConcurrent(negRiskTasks, CONCURRENCY, async ({ marketId, tokenId }) => {
+        // Try CLOB first
+        if (tokenId) {
+            try {
+                const book = await fetchBook(tokenId);
+                const prices = extractBidAsk(book);
+                // If book is liquid, use it
+                if (prices.lastPrice !== null) return { marketId, ...prices, source: 'clob' };
+            } catch { /* fall through to Gamma */ }
+        }
+        // Gamma API fallback for illiquid negRisk books
+        const gammaPrices = await fetchNegRiskPriceFromGamma(marketId);
+        if (gammaPrices) return { marketId, ...gammaPrices, source: 'gamma' };
+        return { marketId, bestBid: null, bestAsk: null, lastPrice: null, source: 'none' };
+    });
+
+    // ── Batch update DB ───────────────────────────────────────────────────────
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        for (let i = 0; i < results.length; i++) {
-            const settled = results[i];
+
+        const allResults = [...results, ...negRiskResults];
+        const allTasks   = [...tasks, ...negRiskTasks];
+
+        for (let i = 0; i < allResults.length; i++) {
+            const settled = allResults[i];
             if (settled.status === 'rejected') {
-                console.warn(`  Failed ${tasks[i].marketId}: ${settled.reason?.message}`);
+                console.warn(`  Failed ${allTasks[i].marketId}: ${settled.reason?.message}`);
                 failed++;
                 continue;
             }
-            const { marketId, bestBid, bestAsk, lastPrice } = settled.value;
-            // Only overwrite last_price when the order book is liquid enough
-            // to produce a meaningful mid-price. Otherwise preserve the Gamma
-            // API price written by sync_polymarket (avoids 0.5 placeholder).
+            const { marketId, bestBid, bestAsk, lastPrice, source } = settled.value;
+            if (source === 'gamma') negRiskFallbacks++;
+
             if (lastPrice !== null) {
                 await client.query(
                     `UPDATE polymarket_markets
@@ -154,13 +234,16 @@ async function sync() {
                      WHERE id = $5`,
                     [bestBid, bestAsk, lastPrice, now, marketId]
                 );
-            } else {
+            } else if (bestBid !== null || bestAsk !== null) {
                 await client.query(
                     `UPDATE polymarket_markets
                      SET best_bid = $1, best_ask = $2, price_updated_at = $3
                      WHERE id = $4`,
                     [bestBid, bestAsk, now, marketId]
                 );
+            } else {
+                // No prices at all — skip update to preserve existing data
+                continue;
             }
             updated++;
         }
@@ -174,16 +257,17 @@ async function sync() {
             updated: 0, failed: 0, totalMarkets: markets.length,
             intervalMs: SYNC_INTERVAL_MS, nextSync: new Date(Date.now() + SYNC_INTERVAL_MS).toISOString(),
         });
+        return;
     } finally {
         client.release();
     }
 
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-    console.log(`Done. ${updated} updated, ${failed} failed in ${elapsed}s`);
+    console.log(`Done. ${updated} updated (${negRiskFallbacks} via Gamma fallback), ${failed} failed in ${elapsed}s`);
     writeStatus({
         status: failed > 0 && updated === 0 ? 'error' : 'ok',
         lastSync: new Date().toISOString(), durationSec: elapsed,
-        updated, failed, totalMarkets: markets.length,
+        updated, failed, negRiskFallbacks, totalMarkets: markets.length,
         intervalMs: SYNC_INTERVAL_MS, nextSync: new Date(Date.now() + SYNC_INTERVAL_MS).toISOString(),
     });
 }

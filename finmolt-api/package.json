@@ -15,7 +15,10 @@
     "polymarket:watch": "node scripts/sync_polymarket.js --watch",
     "trading:migrate": "node scripts/migrate_trading.js",
     "prices:sync": "node scripts/sync_prices.js",
-    "prices:watch": "node scripts/sync_prices.js --watch"
+    "prices:watch": "node scripts/sync_prices.js --watch",
+    "polymarket:validate": "node scripts/validate_sync.js",
+    "settle:once": "node scripts/settle_worker.js",
+    "settle:watch": "node scripts/settle_worker.js --watch"
   },
   "keywords": [
     "finmolt",

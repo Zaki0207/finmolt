@@ -16,10 +16,44 @@ const STATUS_FILE = process.env.SYNC_STATUS_FILE || null;
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
-const POLYMARKET_BASE   = 'https://gamma-api.polymarket.com';
-const PAGE_SIZE         = 100;
-const BATCH_SIZE        = 500;   // rows per batch upsert
-const SYNC_INTERVAL_MS  = Number(process.env.POLYMARKET_SYNC_INTERVAL_MS) || 10 * 60 * 1000;
+const POLYMARKET_BASE  = 'https://gamma-api.polymarket.com';
+const PAGE_SIZE        = 100;
+const BATCH_SIZE       = 500;   // rows per batch upsert
+const SYNC_INTERVAL_MS = Number(process.env.POLYMARKET_SYNC_INTERVAL_MS) || 10 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Retry-aware fetch helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch with exponential-backoff retry on 429 / 5xx.
+ * @param {string} url
+ * @param {{ maxRetries?: number, signal?: AbortSignal }} [opts]
+ */
+async function fetchWithRetry(url, { maxRetries = 3, signal } = {}) {
+    let lastError;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            const res = await fetch(url, signal ? { signal } : {});
+            if (res.status === 429 || res.status >= 500) {
+                lastError = new Error(`HTTP ${res.status}`);
+                const backoff = Math.min(1000 * Math.pow(2, attempt), 30_000);
+                await new Promise(r => setTimeout(r, backoff));
+                continue;
+            }
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            return res;
+        } catch (err) {
+            if (err.name === 'AbortError') throw err;
+            lastError = err;
+            if (attempt < maxRetries - 1) {
+                const backoff = Math.min(1000 * Math.pow(2, attempt), 30_000);
+                await new Promise(r => setTimeout(r, backoff));
+            }
+        }
+    }
+    throw lastError;
+}
 
 // ---------------------------------------------------------------------------
 // Fetch helpers
@@ -31,8 +65,7 @@ async function fetchPage(params, offset) {
     url.searchParams.set('limit',  String(PAGE_SIZE));
     url.searchParams.set('offset', String(offset));
 
-    const res = await fetch(url.toString());
-    if (!res.ok) throw new Error(`Polymarket HTTP ${res.status} at offset ${offset}`);
+    const res = await fetchWithRetry(url.toString());
     const data = await res.json();
     return Array.isArray(data) ? data : [];
 }
@@ -54,27 +87,80 @@ async function fetchAllPages(params, label, maxEvents = Infinity) {
     return all.slice(0, maxEvents);
 }
 
+/**
+ * Fetch closed events incrementally using the last-seen closedTime as cursor.
+ * On the very first sync (no closed events in DB) falls back to capped full fetch.
+ * On subsequent syncs fetches only events closed after the last watermark.
+ */
+async function fetchClosedEventsIncremental() {
+    // Watermark = last time we successfully synced any closed event.
+    // polymarket_events has no closed_time column, so we use fetched_at
+    // (updated on every successful upsert) as a proxy for "last sync time".
+    const { rows: wmRows } = await pool.query(`
+        SELECT MAX(fetched_at) AS watermark
+        FROM polymarket_events
+        WHERE closed = true
+    `);
+    const watermark = wmRows[0]?.watermark;
+
+    if (!watermark) {
+        // First sync: full fetch capped at 2000 (covers more history than old 500 cap)
+        console.log(`  [closed] No watermark — full fetch (cap 2000)`);
+        return fetchAllPages(
+            { closed: 'true', order: 'closedTime', ascending: 'false' },
+            'closed',
+            2000
+        );
+    }
+
+    // Incremental: fetch newest-first (by closedTime from API response),
+    // stop when we hit events whose closedTime predates our last sync.
+    // Use SYNC_INTERVAL_MS as buffer so events that closed during the last
+    // cycle aren't missed due to timing skew.
+    const watermarkMs = new Date(watermark).getTime() - SYNC_INTERVAL_MS;
+    const newClosed   = [];
+    let offset = 0;
+
+    while (true) {
+        const page = await fetchPage(
+            { closed: 'true', order: 'closedTime', ascending: 'false' },
+            offset
+        );
+        if (page.length === 0) break;
+
+        for (const event of page) {
+            // closedTime comes from the API response (not from DB)
+            const closedMs = event.closedTime ? new Date(event.closedTime).getTime() : Infinity;
+            if (closedMs > watermarkMs) newClosed.push(event);
+        }
+
+        // Desc order: last element on the page = oldest closedTime on this page.
+        // If it's before the watermark, all following pages will be too — stop.
+        const oldest   = page[page.length - 1];
+        const oldestMs = oldest?.closedTime ? new Date(oldest.closedTime).getTime() : 0;
+        if (oldestMs <= watermarkMs) break;
+
+        if (page.length < PAGE_SIZE) break;
+        offset += PAGE_SIZE;
+    }
+
+    console.log(`  [closed] Incremental fetch: ${newClosed.length} new closed events`);
+    return newClosed;
+}
+
 async function fetchAllEvents() {
-    // Fetch active + open events (the bulk — same as original filter)
+    // Fetch active + open events
     const active = await fetchAllPages(
         { active: 'true', closed: 'false', order: 'id', ascending: 'false' },
         'active'
     );
     console.log(`Fetched ${active.length} active events`);
 
-    // Fetch recently closed events (catch resolutions — cap at 500 to keep sync fast).
-    // Sort by closedTime desc so the most recently closed events are always captured
-    // within the cap, regardless of how many total closed events exist.
-    const closed = await fetchAllPages(
-        { closed: 'true', order: 'closedTime', ascending: 'false' },
-        'closed',
-        500
-    );
+    // Fetch recently closed events (incremental cursor-based)
+    const closed = await fetchClosedEventsIncremental();
     console.log(`Fetched ${closed.length} recently closed events`);
 
-    // Fetch inactive-but-not-yet-closed events (e.g. recurring 5-min markets that
-    // have expired: event.active=false, event.closed=false). These fall through both
-    // queries above but their individual markets may have closed=true on the API.
+    // Fetch inactive-but-not-yet-closed events (recurring short-duration markets)
     const inactive = await fetchAllPages(
         { active: 'false', closed: 'false', order: 'id', ascending: 'false' },
         'inactive',
@@ -105,12 +191,6 @@ function parseOutcomes(raw) {
 
 /**
  * Build a multi-row INSERT ... ON CONFLICT DO UPDATE statement.
- * @param {string} table
- * @param {string[]} cols - column names
- * @param {Array<Array>} rows - array of value arrays (one per row)
- * @param {string[]} updateCols - columns to update on conflict
- * @param {string} conflictTarget - e.g. '(id)' or '(event_id, tag_id)'
- * @returns {{ text: string, values: any[] }}
  */
 function buildBatchUpsert(table, cols, rows, updateCols, conflictTarget) {
     const values = [];
@@ -123,11 +203,9 @@ function buildBatchUpsert(table, cols, rows, updateCols, conflictTarget) {
         values.push(...row);
     }
 
+    const priceProtectedCols = new Set(['last_price', 'price_updated_at', 'best_bid', 'best_ask']);
     const updateSet = updateCols.map(c =>
-        // Use COALESCE so a null from EXCLUDED never overwrites an existing value.
-        // This prevents sync_polymarket from wiping prices written by sync_prices.
-        // Must qualify the fallback column with the table name to avoid ambiguity.
-        c === 'last_price' || c === 'price_updated_at' || c === 'best_bid' || c === 'best_ask'
+        priceProtectedCols.has(c)
             ? `${c} = COALESCE(EXCLUDED.${c}, ${table}.${c})`
             : `${c} = EXCLUDED.${c}`
     ).join(', ');
@@ -154,20 +232,25 @@ async function batchUpsertEvents(client, events) {
 
     for (let i = 0; i < events.length; i += BATCH_SIZE) {
         const batch = events.slice(i, i + BATCH_SIZE);
-        const rows = batch.map(e => [
-            e.id,
-            e.slug,
-            e.title,
-            e.description || null,
-            e.image || null,
-            e.icon || null,
-            !!e.negRisk,
-            e.active,
-            e.closed,
-            e.startDate || null,
-            e.endDate || null,
-            now,
-        ]);
+        const rows = batch.map(e => {
+            // Issue #5/#6: active=true AND closed=true is contradictory.
+            // Treat closed as authoritative — if closed, force active=false.
+            const active = e.closed ? false : e.active;
+            return [
+                e.id,
+                e.slug,
+                e.title,
+                e.description || null,
+                e.image || null,
+                e.icon || null,
+                !!e.negRisk,
+                active,
+                e.closed,
+                e.startDate || null,
+                e.endDate || null,
+                now,
+            ];
+        });
         const q = buildBatchUpsert('polymarket_events', cols, rows, updateCols, '(id)');
         await client.query(q.text, q.values);
     }
@@ -175,8 +258,6 @@ async function batchUpsertEvents(client, events) {
 
 /**
  * Extract YES outcome price from the gamma API market object.
- * The gamma API returns outcomePrices as a JSON string like '["0.54","0.46"]'
- * or already as an array. Index 0 = YES token price (≈ best_ask).
  */
 function extractYesPrice(m) {
     try {
@@ -185,10 +266,24 @@ function extractYesPrice(m) {
         const arr = Array.isArray(raw) ? raw : JSON.parse(raw);
         const price = parseFloat(arr[0]);
         if (!isFinite(price)) return null;
-        // 0.5 is Polymarket's default placeholder for markets with no real trades.
-        // Only accept it if bestAsk or bestBid confirm there's a real order book.
         if (price === 0.5 && m.bestAsk == null && m.bestBid == null) return null;
         return price;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Parse outcomePrices into a numeric array, returning null if unavailable.
+ */
+function parseOutcomePrices(m) {
+    try {
+        const raw = m.outcomePrices;
+        if (!raw) return null;
+        const arr = Array.isArray(raw) ? raw : JSON.parse(raw);
+        const prices = arr.map(p => parseFloat(p));
+        if (prices.some(p => !isFinite(p))) return null;
+        return prices;
     } catch {
         return null;
     }
@@ -201,6 +296,7 @@ async function batchUpsertMarkets(client, allMarkets) {
         'active', 'closed', 'resolved_outcome',
         'start_date', 'end_date', 'closed_time', 'fetched_at',
         'best_bid', 'best_ask', 'last_price', 'price_updated_at', 'volume',
+        'outcome_prices',
     ];
     const updateCols = [
         'question', 'slug', 'description', 'image',
@@ -208,23 +304,27 @@ async function batchUpsertMarkets(client, allMarkets) {
         'active', 'closed', 'resolved_outcome',
         'start_date', 'end_date', 'closed_time', 'fetched_at',
         'best_bid', 'best_ask', 'last_price', 'price_updated_at', 'volume',
+        'outcome_prices',
     ];
     const now = new Date();
 
     for (let i = 0; i < allMarkets.length; i += BATCH_SIZE) {
         const batch = allMarkets.slice(i, i + BATCH_SIZE);
         const rows = batch.map(m => {
-            const yesPrice = extractYesPrice(m);
-            // Derive resolved_outcome from outcomePrices collapse (0/1) when not explicit
+            const yesPrice      = extractYesPrice(m);
+            const outcomePricesArr = parseOutcomePrices(m);
+
+            // Issue #5/#6: active=true AND closed=true is contradictory.
+            const active = m.closed ? false : m.active;
+
+            // Derive resolved_outcome: prefer outcomePrices collapse over string matching
             let resolvedOutcome = m.resolvedOutcome || null;
-            if (!resolvedOutcome && m.closed) {
-                try {
-                    const prices   = Array.isArray(m.outcomePrices) ? m.outcomePrices : JSON.parse(m.outcomePrices || '[]');
-                    const outcomes = parseOutcomes(m.outcomes);
-                    const winIdx   = prices.findIndex(p => parseFloat(p) === 1);
-                    if (winIdx !== -1 && outcomes[winIdx]) resolvedOutcome = outcomes[winIdx];
-                } catch { /* ignore */ }
+            if (!resolvedOutcome && m.closed && outcomePricesArr) {
+                const outcomes = parseOutcomes(m.outcomes);
+                const winIdx   = outcomePricesArr.findIndex(p => p >= 0.99);
+                if (winIdx !== -1 && outcomes[winIdx]) resolvedOutcome = outcomes[winIdx];
             }
+
             return [
                 m.id,
                 m._eventId,
@@ -236,7 +336,7 @@ async function batchUpsertMarkets(client, allMarkets) {
                 JSON.stringify(parseOutcomes(m.clobTokenIds)),
                 m.groupItemTitle || null,
                 !!m.negRisk,
-                m.active,
+                active,
                 m.closed,
                 resolvedOutcome,
                 m.startDate || null,
@@ -247,7 +347,8 @@ async function batchUpsertMarkets(client, allMarkets) {
                 m.bestAsk != null ? parseFloat(m.bestAsk) : null,
                 yesPrice,
                 (m.bestBid != null || m.bestAsk != null || yesPrice !== null) ? now : null,
-                m.volume   != null ? parseFloat(m.volume)   : null,
+                m.volume   != null ? parseFloat(m.volume) : null,
+                outcomePricesArr ? JSON.stringify(outcomePricesArr) : null,
             ];
         });
         const q = buildBatchUpsert('polymarket_markets', cols, rows, updateCols, '(id)');
@@ -287,14 +388,7 @@ async function batchUpsertEventTags(client, eventTagPairs) {
 // Targeted re-sync: refresh markets that have open positions
 // ---------------------------------------------------------------------------
 
-/**
- * For every market that has unsettled agent positions, fetch the current
- * status directly from the Gamma API (/events/:id) and update the DB.
- * This is necessary because the Polymarket list API caps at 500 results,
- * which is not enough to cover the volume of recurring short-duration markets.
- */
 async function refreshPositionMarkets() {
-    // Find distinct event IDs that have unsettled positions
     const { rows } = await pool.query(`
         SELECT DISTINCT pm.event_id, pm.id AS market_id
         FROM agent_positions ap
@@ -309,39 +403,40 @@ async function refreshPositionMarkets() {
 
     for (const eventId of eventIds) {
         try {
-            const res = await fetch(`${POLYMARKET_BASE}/events/${eventId}`);
-            if (!res.ok) {
-                console.warn(`  [refresh] Event ${eventId}: HTTP ${res.status}`);
-                continue;
-            }
+            const res = await fetchWithRetry(`${POLYMARKET_BASE}/events/${eventId}`);
             const event = await res.json();
 
             const client = await pool.connect();
             try {
                 await client.query('BEGIN');
 
-                // Update event row
+                const eventActive = event.closed ? false : event.active;
                 await client.query(`
                     UPDATE polymarket_events
                     SET active = $1, closed = $2, fetched_at = NOW()
                     WHERE id = $3
-                `, [event.active, event.closed, eventId]);
+                `, [eventActive, event.closed, eventId]);
 
-                // Update each market nested in the event
                 for (const m of (event.markets || [])) {
-                    // Derive resolved_outcome from outcomePrices if not explicitly set.
-                    // Polymarket recurring markets collapse prices to "0"/"1" on resolution
-                    // instead of writing resolvedOutcome. Price "1" = winning outcome.
+                    const outcomePricesArr = parseOutcomePrices(m);
+                    const marketActive = m.closed ? false : m.active;
+
                     let resolvedOutcome = m.resolvedOutcome || null;
                     if (!resolvedOutcome && m.closed) {
-                        try {
-                            const prices  = Array.isArray(m.outcomePrices) ? m.outcomePrices : JSON.parse(m.outcomePrices || '[]');
+                        if (outcomePricesArr) {
                             const outcomes = parseOutcomes(m.outcomes);
-                            const winIdx  = prices.findIndex(p => parseFloat(p) === 1);
-                            if (winIdx !== -1 && outcomes[winIdx]) {
-                                resolvedOutcome = outcomes[winIdx];
-                            }
-                        } catch { /* ignore parse errors */ }
+                            const winIdx   = outcomePricesArr.findIndex(p => p >= 0.99);
+                            if (winIdx !== -1 && outcomes[winIdx]) resolvedOutcome = outcomes[winIdx];
+                        }
+                        // Legacy fallback: scan for price=1 string
+                        if (!resolvedOutcome) {
+                            try {
+                                const prices  = Array.isArray(m.outcomePrices) ? m.outcomePrices : JSON.parse(m.outcomePrices || '[]');
+                                const outcomes = parseOutcomes(m.outcomes);
+                                const winIdx  = prices.findIndex(p => parseFloat(p) === 1);
+                                if (winIdx !== -1 && outcomes[winIdx]) resolvedOutcome = outcomes[winIdx];
+                            } catch { /* ignore */ }
+                        }
                     }
 
                     await client.query(`
@@ -350,19 +445,21 @@ async function refreshPositionMarkets() {
                             closed           = $2,
                             closed_time      = $3,
                             resolved_outcome = $4,
+                            outcome_prices   = $5,
                             fetched_at       = NOW()
-                        WHERE id = $5
+                        WHERE id = $6
                     `, [
-                        m.active,
+                        marketActive,
                         m.closed,
                         m.closedTime || null,
                         resolvedOutcome,
+                        outcomePricesArr ? JSON.stringify(outcomePricesArr) : null,
                         m.id,
                     ]);
                 }
 
                 await client.query('COMMIT');
-                console.log(`  [refresh] Event ${eventId} (${event.title?.substring(0, 50)}): active=${event.active}, closed=${event.closed}`);
+                console.log(`  [refresh] Event ${eventId} (${event.title?.substring(0, 50)}): active=${eventActive}, closed=${event.closed}`);
             } catch (err) {
                 await client.query('ROLLBACK').catch(() => {});
                 console.error(`  [refresh] Event ${eventId} DB update failed:`, err.message);
@@ -380,17 +477,29 @@ async function refreshPositionMarkets() {
 // ---------------------------------------------------------------------------
 
 /**
+ * Normalize a string for matching: lowercase, trim, remove punctuation.
+ */
+function normalizeOutcome(s) {
+    return String(s).toLowerCase().trim().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, ' ');
+}
+
+/**
  * Settle all unsettled positions for resolved & closed markets.
- * One transaction per market so row-level locks stay short.
- * Returns total number of positions settled.
+ *
+ * Priority for winner determination:
+ *   1. outcomePrices[idx] ≥ 0.99 (price collapsed to 1 = winner)
+ *   2. Normalized string match against resolved_outcome
+ *   3. Binary market: last_price ≥ 0.99 → YES won; ≤ 0.01 → NO won
+ *
+ * Multi-choice payout: uses outcomePrices[outcomeIdx] so each outcome
+ * receives the correct settlement fraction (not just 0 or 1).
  */
 async function settleMarkets() {
     const { rows: markets } = await pool.query(`
-        SELECT pm.id, pm.resolved_outcome, pm.outcomes, pm.question,
+        SELECT pm.id, pm.resolved_outcome, pm.outcomes, pm.outcome_prices, pm.question,
                pm.last_price, pm.best_bid, pm.best_ask
         FROM polymarket_markets pm
-        WHERE pm.resolved_outcome IS NOT NULL
-          AND pm.closed = true
+        WHERE pm.closed = true
           AND EXISTS (
               SELECT 1 FROM agent_positions ap
               WHERE ap.market_id = pm.id
@@ -401,7 +510,7 @@ async function settleMarkets() {
 
     if (markets.length === 0) return 0;
 
-    console.log(`[settle] ${markets.length} resolved market(s) with unsettled positions`);
+    console.log(`[settle] ${markets.length} closed market(s) with unsettled positions`);
 
     let totalSettled = 0;
 
@@ -410,24 +519,47 @@ async function settleMarkets() {
             ? market.outcomes
             : JSON.parse(market.outcomes || '[]');
 
-        let winningIdx = outcomes.findIndex(o =>
-            String(o).toLowerCase().trim() === String(market.resolved_outcome).toLowerCase().trim()
-        );
-
-        // Fallback: for binary markets, infer winner from stored price (last_price ≈ 1.0 → YES won)
-        if (winningIdx === -1 && outcomes.length === 2) {
-            const price = parseFloat(market.last_price ?? market.best_ask ?? market.best_bid ?? 'NaN');
-            if (price >= 0.99) winningIdx = 0;        // YES won
-            else if (price <= 0.01) winningIdx = 1;   // NO won
+        // Parse stored outcome_prices (may be null for older records)
+        let settlementPrices = null;
+        if (market.outcome_prices) {
+            try {
+                settlementPrices = Array.isArray(market.outcome_prices)
+                    ? market.outcome_prices
+                    : JSON.parse(market.outcome_prices);
+            } catch { /* ignore */ }
         }
 
-        if (winningIdx === -1) {
+        // ── Determine winning index ───────────────────────────────────────────
+
+        let winningIdx = -1;
+
+        // Priority 1: outcomePrices collapse (price ≥ 0.99 = winner)
+        if (settlementPrices) {
+            winningIdx = settlementPrices.findIndex(p => p >= 0.99);
+        }
+
+        // Priority 2: normalized string match against resolved_outcome
+        if (winningIdx === -1 && market.resolved_outcome) {
+            const needle = normalizeOutcome(market.resolved_outcome);
+            winningIdx = outcomes.findIndex(o => normalizeOutcome(o) === needle);
+        }
+
+        // Priority 3: binary market last_price fallback
+        if (winningIdx === -1 && outcomes.length === 2) {
+            const price = parseFloat(market.last_price ?? market.best_ask ?? market.best_bid ?? 'NaN');
+            if (price >= 0.99) winningIdx = 0;       // YES won
+            else if (price <= 0.01) winningIdx = 1;  // NO won
+        }
+
+        if (winningIdx === -1 && !settlementPrices) {
             console.warn(
-                `  [settle] Market ${market.id}: resolved_outcome "${market.resolved_outcome}" ` +
-                `not found in ${JSON.stringify(outcomes)} — skipping`
+                `  [settle] Market ${market.id}: cannot determine winner ` +
+                `(resolved_outcome="${market.resolved_outcome}", no outcomePrices) — skipping`
             );
             continue;
         }
+
+        // ── Settle positions ──────────────────────────────────────────────────
 
         const client = await pool.connect();
         try {
@@ -441,9 +573,22 @@ async function settleMarkets() {
             `, [market.id]);
 
             for (const pos of positions) {
-                const isWinner     = Number(pos.outcome_idx) === winningIdx;
-                const payout       = parseFloat(pos.shares) * (isWinner ? 1.0 : 0.0);
-                const realisedPnl  = parseFloat(pos.shares) * ((isWinner ? 1.0 : 0.0) - parseFloat(pos.avg_cost));
+                const idx = Number(pos.outcome_idx);
+                const shares = parseFloat(pos.shares);
+                const avgCost = parseFloat(pos.avg_cost);
+
+                // Payout per share:
+                // - If outcomePrices available: use the stored settlement price for this outcome
+                // - Otherwise: winner-takes-all (1 or 0)
+                let payoutPerShare;
+                if (settlementPrices && settlementPrices[idx] != null) {
+                    payoutPerShare = settlementPrices[idx];
+                } else {
+                    payoutPerShare = (winningIdx !== -1 && idx === winningIdx) ? 1.0 : 0.0;
+                }
+
+                const payout      = parseFloat((shares * payoutPerShare).toFixed(6));
+                const realisedPnl = parseFloat((shares * (payoutPerShare - avgCost)).toFixed(6));
 
                 if (payout > 0) {
                     await client.query(`
@@ -461,15 +606,26 @@ async function settleMarkets() {
                         updated_at   = NOW()
                     WHERE id = $2
                 `, [realisedPnl, pos.id]);
+
+                // Audit ledger entry
+                const ledgerType = payout > 0 ? 'settlement_win' : 'settlement_loss';
+                const { rows: portRows } = await client.query(
+                    'SELECT balance_usdc FROM agent_portfolios WHERE agent_id = $1',
+                    [pos.agent_id]
+                );
+                if (portRows.length > 0) {
+                    await client.query(`
+                        INSERT INTO agent_ledger (agent_id, type, amount, balance_after, reference_id)
+                        VALUES ($1, $2, $3, $4, $5)
+                    `, [pos.agent_id, ledgerType, payout, parseFloat(portRows[0].balance_usdc), pos.id]);
+                }
             }
 
             await client.query('COMMIT');
 
-            const label = (market.question || market.id).substring(0, 60);
-            console.log(
-                `  [settle] "${label}…" winner=${outcomes[winningIdx]}(idx ${winningIdx}),` +
-                ` settled ${positions.length} position(s)`
-            );
+            const label     = (market.question || market.id).substring(0, 60);
+            const winnerStr = winningIdx !== -1 ? `winner=${outcomes[winningIdx]}(idx ${winningIdx})` : 'multi-price settlement';
+            console.log(`  [settle] "${label}…" ${winnerStr}, settled ${positions.length} position(s)`);
             totalSettled += positions.length;
         } catch (err) {
             await client.query('ROLLBACK').catch(() => {});
@@ -501,7 +657,7 @@ async function sync() {
     let events, activeIds;
     try {
         const result = await fetchAllEvents();
-        events = result.events;
+        events   = result.events;
         activeIds = result.activeIds;
     } catch (err) {
         console.error('Fetch failed:', err.message);
@@ -515,19 +671,16 @@ async function sync() {
 
     console.log(`Fetched ${events.length} total events. Upserting in chunks…`);
 
-    // Collect all markets, tags, and event-tag pairs
     const allMarkets = [];
-    const tagsMap = new Map();       // tag.id → { id, label, slug }
-    const eventTagPairs = [];        // { eventId, tagId }
+    const tagsMap = new Map();
+    const eventTagPairs = [];
     const eventIdsWithTags = new Set();
 
     for (const event of events) {
-        // Markets
         for (const market of (event.markets || [])) {
             market._eventId = event.id;
             allMarkets.push(market);
         }
-        // Tags
         for (const tag of (event.tags || [])) {
             if (!tag.id) continue;
             tagsMap.set(tag.id, { id: tag.id, label: tag.label, slug: tag.slug });
@@ -536,18 +689,17 @@ async function sync() {
         }
     }
 
-    // Process in chunked transactions
-    const CHUNK = 1000;
+    const CHUNK  = 1000;
     const client = await pool.connect();
 
     try {
-        // --- Transaction 1: Upsert tags (small, fast) ---
+        // Tags
         await client.query('BEGIN');
         await batchUpsertTags(client, tagsMap);
         await client.query('COMMIT');
         console.log(`Upserted ${tagsMap.size} tags`);
 
-        // --- Transaction 2: Upsert events in chunks ---
+        // Events
         for (let i = 0; i < events.length; i += CHUNK) {
             const chunk = events.slice(i, i + CHUNK);
             await client.query('BEGIN');
@@ -561,7 +713,7 @@ async function sync() {
         }
         console.log(`Upserted ${events.length} events`);
 
-        // --- Transaction 3: Upsert markets in chunks ---
+        // Markets
         for (let i = 0; i < allMarkets.length; i += CHUNK) {
             const chunk = allMarkets.slice(i, i + CHUNK);
             await client.query('BEGIN');
@@ -575,9 +727,8 @@ async function sync() {
         }
         console.log(`Upserted ${allMarkets.length} markets`);
 
-        // --- Transaction 4: Upsert event-tag junction ---
+        // Event-tag junction
         await client.query('BEGIN');
-        // Delete old associations for events we're updating, then re-insert
         if (eventIdsWithTags.size > 0) {
             await client.query(
                 `DELETE FROM polymarket_event_tags WHERE event_id = ANY($1::varchar[])`,
@@ -588,7 +739,9 @@ async function sync() {
         await client.query('COMMIT');
         console.log(`Upserted ${eventTagPairs.length} event-tag associations`);
 
-        // --- Transaction 5: Mark stale events ---
+        // Stale event sweep:
+        // Only mark events as inactive if they were absent AND have no open agent positions.
+        // This prevents accidentally deactivating markets that are just beyond the fetch cap.
         if (activeIds.length > 0) {
             await client.query('BEGIN');
             await client.query(`
@@ -596,14 +749,20 @@ async function sync() {
                 SET active = false, fetched_at = NOW()
                 WHERE active = true
                   AND id != ALL($1::varchar[])
+                  AND id NOT IN (
+                      SELECT DISTINCT pm.event_id
+                      FROM agent_positions ap
+                      JOIN polymarket_markets pm ON pm.id = ap.market_id
+                      WHERE ap.settled_at IS NULL AND ap.shares > 0
+                  )
             `, [activeIds]);
             await client.query('COMMIT');
         }
 
-        // --- Targeted refresh: re-fetch markets with open positions to get latest status ---
+        // Targeted refresh for markets with open positions
         await refreshPositionMarkets();
 
-        // --- Settlement: resolve positions for closed/resolved markets ---
+        // Settlement
         const settledCount = await settleMarkets();
         if (settledCount > 0) {
             console.log(`Settlement complete: ${settledCount} position(s) settled`);
@@ -628,8 +787,6 @@ async function sync() {
         client.release();
     }
 
-    // Post-sync validation: check for data anomalies, auto-correct where safe,
-    // and write a sync health report to sync-health.json.
     try {
         await validateSync(pool);
     } catch (err) {

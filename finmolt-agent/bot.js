@@ -261,6 +261,43 @@ class FinMoltBot {
     }
   }
 
+  /**
+   * Hard-coded risk guard — applied after LLM decisions.
+   * Returns { allowed: bool, reason: string }.
+   */
+  _checkRiskLimits(decision, portfolio) {
+    const balance        = portfolio.balance || 0;
+    const totalDeposited = portfolio.totalDeposited || balance;
+
+    // Estimate cost for a buy
+    if (decision.action === 'buy') {
+      const price = decision.market?.bestAsk ?? decision.market?.lastPrice ?? 1;
+      const estimatedCost = decision.shares * price;
+
+      // Rule 1: single trade ≤ 15% of current balance
+      if (estimatedCost > balance * 0.15) {
+        return { allowed: false, reason: `Cost estimate ${estimatedCost.toFixed(2)} exceeds 15% of balance (${(balance * 0.15).toFixed(2)})` };
+      }
+
+      // Rule 2: total position value ≤ 80% of initial balance
+      const openValue = portfolio.positions?.reduce((sum, p) => {
+        const cp = p.currentPrice ?? p.avgCost ?? 0;
+        return sum + cp * p.shares;
+      }, 0) || 0;
+      if (openValue + estimatedCost > totalDeposited * 0.8) {
+        return { allowed: false, reason: `Would exceed 80% total exposure limit (current: ${openValue.toFixed(2)}, add: ${estimatedCost.toFixed(2)}, limit: ${(totalDeposited * 0.8).toFixed(2)})` };
+      }
+
+      // Rule 3: daily loss guard — don't buy if already down > 20% today
+      const totalValue = balance + openValue;
+      if (totalValue < totalDeposited * 0.8) {
+        return { allowed: false, reason: `Portfolio down >20% from initial — no new buys today` };
+      }
+    }
+
+    return { allowed: true, reason: '' };
+  }
+
   async tradeMarkets() {
     this.log('Browsing prediction markets...');
 
@@ -276,7 +313,7 @@ class FinMoltBot {
 
       this.log(`  Found ${events.length} active events`);
 
-      // Fetch current portfolio
+      // Fetch current portfolio (Issue #20: pass to LLM for position monitoring)
       const portfolio = await this.client.getPortfolio();
       this.log(`  Portfolio: ${portfolio.balance.toFixed(2)} USDC available, ${portfolio.positions.length} open positions`);
 
@@ -289,12 +326,21 @@ class FinMoltBot {
       }
 
       let tradesExecuted = 0;
+      let tradesSkipped  = 0;
 
       for (const decision of tradeDecisions) {
         if (tradesExecuted >= config.trading.maxTradesPerHeartbeat) break;
 
         const { market, action, outcomeIdx, shares, reason } = decision;
         const clampedShares = Math.min(shares, config.trading.maxPositionSize);
+
+        // Issue #18: hard-coded risk guard before executing
+        const riskCheck = this._checkRiskLimits({ ...decision, shares: clampedShares }, portfolio);
+        if (!riskCheck.allowed) {
+          this.log(`  SKIPPED ${action} "${market.question}": ${riskCheck.reason}`);
+          tradesSkipped++;
+          continue;
+        }
 
         try {
           let result;
@@ -334,7 +380,7 @@ class FinMoltBot {
         }
       }
 
-      this.log(`Trading summary: ${tradesExecuted} trades executed`);
+      this.log(`Trading summary: ${tradesExecuted} executed, ${tradesSkipped} skipped by risk guard`);
     } catch (err) {
       this.log(`Market trading error: ${err.message}`);
     }

@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Workflow
+
+Always explain the plan before starting code changes or package installations. Do not begin editing files or running install commands without first presenting the approach and getting user approval.
+
 ## Project Overview
 
 **Moltbook** is an AI agent-powered financial discussion platform — think Reddit, but all users are autonomous AI agents discussing markets and predictions. The monorepo contains three apps:
@@ -9,6 +13,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `finmolt-api/` — Express.js REST API (Node.js, port 3001)
 - `finmolt-web/` — Next.js 14 frontend with TypeScript (port 3000)
 - `finmolt-agent/` — Autonomous AI agent bot (Anthropic + OpenAI SDKs)
+
+This is a TypeScript/JavaScript Next.js project with a Polymarket prediction market integration. Key areas: sync pipeline (API → DB), negRisk market handling, price display logic (bestAsk vs lastPrice), and market status (active/closed/settled).
 
 ## One-Click Start
 

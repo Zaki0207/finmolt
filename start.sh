@@ -67,6 +67,7 @@ cleanup() {
     log "正在停止所有服务..."
     kill_service "$PID_DIR/prices.pid"     "CLOB Price Sync"
     kill_service "$PID_DIR/polymarket.pid" "Polymarket Sync"
+    kill_service "$PID_DIR/settle.pid"     "Settlement Worker"
     kill_service "$PID_DIR/agent.pid"      "Agent Bot"
     kill_service "$PID_DIR/web.pid"        "Web"
     kill_service "$PID_DIR/api.pid"        "API"
@@ -190,10 +191,11 @@ main() {
 
         # 初次同步完成后运行数据完整性校验（validate_sync 也在每次 polymarket sync 结束时自动调用）
         step "数据完整性校验"
-        if (cd "$API_DIR" && node scripts/validate_sync.js); then
-            log "数据校验完成 ✓  报告: $API_DIR/sync-health.json"
+        SYNC_HEALTH_FILE="${SYNC_HEALTH_FILE:-/tmp/finmolt-sync-health.json}"
+        if (cd "$API_DIR" && SYNC_HEALTH_FILE="$SYNC_HEALTH_FILE" node scripts/validate_sync.js); then
+            log "数据校验完成 ✓  报告: $SYNC_HEALTH_FILE"
         else
-            warn "数据校验异常，请查看 $API_DIR/sync-health.json"
+            warn "数据校验异常，请查看 $SYNC_HEALTH_FILE"
         fi
     fi
 
@@ -235,6 +237,13 @@ main() {
             SYNC_STATUS_FILE="$PID_DIR/prices_status.json" \
             node scripts/sync_prices.js --watch > "$PID_DIR/prices.log" 2>&1) &
         echo $! > "$PID_DIR/prices.pid"
+
+        SETTLE_INTERVAL_MS="${SETTLE_INTERVAL_MS:-300000}"
+        log "启动结算 Worker (每 $((SETTLE_INTERVAL_MS / 1000))s)..."
+        (cd "$API_DIR" && SETTLE_INTERVAL_MS="$SETTLE_INTERVAL_MS" \
+            node scripts/settle_worker.js --watch > "$PID_DIR/settle.log" 2>&1) &
+        echo $! > "$PID_DIR/settle.pid"
+
         log "后台同步进程已启动 ✓"
     fi
 
@@ -283,7 +292,8 @@ main() {
     if [[ "$SKIP_POLYMARKET" == false ]]; then
         echo -e "  ${GREEN}市场同步${NC}  每 $((POLYMARKET_SYNC_INTERVAL_MS / 1000))s (含自动数据校验)"
         echo -e "  ${GREEN}价格同步${NC}  每 $((PRICES_SYNC_INTERVAL_MS / 1000))s (CLOB)"
-        echo -e "  ${GREEN}健康报告${NC}  $API_DIR/sync-health.json"
+        echo -e "  ${GREEN}结算 Worker${NC} 每 $((SETTLE_INTERVAL_MS / 1000))s (独立结算进程)"
+        echo -e "  ${GREEN}健康报告${NC}  ${SYNC_HEALTH_FILE:-/tmp/finmolt-sync-health.json}"
     fi
     [[ "$AGENT_STARTED" == true ]] && echo -e "  ${GREEN}Agent Bot${NC} 运行中"
     echo ""
@@ -425,12 +435,14 @@ render_sync_detail() {
 
 status_dashboard() {
     local REFRESH_SEC=5
+    local prev_lines=0
 
     while true; do
         # Check if child processes are still alive
-        local api_alive=false web_alive=false
-        [[ -f "$PID_DIR/api.pid" ]] && kill -0 "$(cat "$PID_DIR/api.pid")" 2>/dev/null && api_alive=true
-        [[ -f "$PID_DIR/web.pid" ]] && kill -0 "$(cat "$PID_DIR/web.pid")" 2>/dev/null && web_alive=true
+        local api_alive=false web_alive=false agent_alive=false settle_alive=false
+        [[ -f "$PID_DIR/api.pid"    ]] && kill -0 "$(cat "$PID_DIR/api.pid")"    2>/dev/null && api_alive=true
+        [[ -f "$PID_DIR/web.pid"    ]] && kill -0 "$(cat "$PID_DIR/web.pid")"    2>/dev/null && web_alive=true
+        [[ -f "$PID_DIR/settle.pid" ]] && kill -0 "$(cat "$PID_DIR/settle.pid")" 2>/dev/null && settle_alive=true
 
         if [[ "$api_alive" == false && "$web_alive" == false ]]; then
             warn "所有核心服务已退出"
@@ -442,53 +454,80 @@ status_dashboard() {
         poly_json=$(read_status_json "$PID_DIR/polymarket_status.json")
         prices_json=$(read_status_json "$PID_DIR/prices_status.json")
 
-        # Render
-        echo -e "\033[2J\033[H"  # clear screen
-        echo ""
-        echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║              FinMolt 服务运行状态                        ║${NC}"
-        echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
-        echo ""
+        [[ -f "$PID_DIR/agent.pid" ]] && kill -0 "$(cat "$PID_DIR/agent.pid")" 2>/dev/null && agent_alive=true
 
-        # Services
-        echo -e " ${CYAN}服务${NC}"
-        if [[ "$api_alive" == true ]]; then
-            echo -e "  ${GREEN}✓${NC} API               http://localhost:$API_PORT"
-        else
-            echo -e "  ${RED}✗${NC} API               ${RED}已停止${NC}"
+        # Capture rendered content into a variable so we can count lines
+        local content
+        content=$(
+            echo ""
+            echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${CYAN}║              FinMolt 服务运行状态                        ║${NC}"
+            echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+
+            echo -e " ${CYAN}服务${NC}"
+            if [[ "$api_alive" == true ]]; then
+                echo -e "  ${GREEN}✓${NC} API               http://localhost:$API_PORT"
+            else
+                echo -e "  ${RED}✗${NC} API               ${RED}已停止${NC}"
+            fi
+            if [[ "$web_alive" == true ]]; then
+                echo -e "  ${GREEN}✓${NC} Web               http://localhost:$WEB_PORT"
+            else
+                echo -e "  ${RED}✗${NC} Web               ${RED}已停止${NC}"
+            fi
+            if [[ "$agent_alive" == true ]]; then
+                echo -e "  ${GREEN}✓${NC} Agent Bot         运行中"
+            elif [[ "$SKIP_AGENT" == false && -d "$AGENT_DIR" ]]; then
+                echo -e "  ${YELLOW}–${NC} Agent Bot         未启动"
+            fi
+            if [[ "$SKIP_POLYMARKET" == false ]]; then
+                if [[ "$settle_alive" == true ]]; then
+                    echo -e "  ${GREEN}✓${NC} Settlement Worker 运行中 (每 $((SETTLE_INTERVAL_MS / 1000))s)"
+                else
+                    echo -e "  ${RED}✗${NC} Settlement Worker ${RED}已停止${NC}"
+                fi
+            fi
+
+            echo ""
+            echo -e " ${CYAN}数据同步${NC}"
+            render_sync_line "Polymarket 市场" "$poly_json"
+            render_sync_detail "$poly_json" "polymarket"
+            render_sync_line "CLOB 实时价格" "$prices_json"
+            render_sync_detail "$prices_json" "prices"
+
+            echo ""
+            echo -e " ${CYAN}日志${NC}"
+            echo "  API:        tail -f $PID_DIR/api.log"
+            echo "  Polymarket: tail -f $PID_DIR/polymarket.log"
+            echo "  Prices:     tail -f $PID_DIR/prices.log"
+            echo "  Settle:     tail -f $PID_DIR/settle.log"
+
+            echo ""
+            echo -e "  刷新间隔: ${REFRESH_SEC}s | 按 ${YELLOW}Ctrl+C${NC} 停止所有服务"
+            echo -e "${CYAN}──────────────────────────────────────────────────────────${NC}"
+        )
+
+        # Move cursor up to overwrite previous render (skip on first iteration)
+        if [[ $prev_lines -gt 0 ]]; then
+            printf "\033[%dA" "$prev_lines"
         fi
-        if [[ "$web_alive" == true ]]; then
-            echo -e "  ${GREEN}✓${NC} Web               http://localhost:$WEB_PORT"
-        else
-            echo -e "  ${RED}✗${NC} Web               ${RED}已停止${NC}"
+
+        # Print each line, clearing stale content first
+        local line_count=0
+        while IFS= read -r line; do
+            printf "\033[2K%s\n" "$line"
+            (( line_count++ ))
+        done <<< "$content"
+
+        # Clear any leftover lines from a previously taller render
+        if [[ $prev_lines -gt $line_count ]]; then
+            local extra=$(( prev_lines - line_count ))
+            for (( i=0; i<extra; i++ )); do printf "\033[2K\n"; done
+            printf "\033[%dA" "$extra"
         fi
 
-        local agent_alive=false
-        if [[ -f "$PID_DIR/agent.pid" ]] && kill -0 "$(cat "$PID_DIR/agent.pid")" 2>/dev/null; then
-            agent_alive=true
-        fi
-        if [[ "$agent_alive" == true ]]; then
-            echo -e "  ${GREEN}✓${NC} Agent Bot         运行中"
-        elif [[ "$SKIP_AGENT" == false && -d "$AGENT_DIR" ]]; then
-            echo -e "  ${YELLOW}–${NC} Agent Bot         未启动"
-        fi
-
-        echo ""
-        echo -e " ${CYAN}数据同步${NC}"
-        render_sync_line "Polymarket 市场" "$poly_json"
-        render_sync_detail "$poly_json" "polymarket"
-        render_sync_line "CLOB 实时价格" "$prices_json"
-        render_sync_detail "$prices_json" "prices"
-
-        echo ""
-        echo -e " ${CYAN}日志${NC}"
-        echo "  API:        tail -f $PID_DIR/api.log"
-        echo "  Polymarket: tail -f $PID_DIR/polymarket.log"
-        echo "  Prices:     tail -f $PID_DIR/prices.log"
-
-        echo ""
-        echo -e "  刷新间隔: ${REFRESH_SEC}s | 按 ${YELLOW}Ctrl+C${NC} 停止所有服务"
-        echo -e "${CYAN}──────────────────────────────────────────────────────────${NC}"
+        prev_lines=$line_count
 
         sleep $REFRESH_SEC
     done

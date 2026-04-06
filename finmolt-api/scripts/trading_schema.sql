@@ -53,6 +53,23 @@ CREATE TABLE IF NOT EXISTS agent_trades (
 CREATE INDEX IF NOT EXISTS idx_agent_trades_agent_id   ON agent_trades(agent_id);
 CREATE INDEX IF NOT EXISTS idx_agent_trades_created_at ON agent_trades(created_at DESC);
 
+-- 5. Settlement prices per outcome (for multi-choice market settlement)
+ALTER TABLE polymarket_markets
+  ADD COLUMN IF NOT EXISTS outcome_prices JSONB;
+
+-- 6. Trade audit ledger (append-only, every balance change)
+CREATE TABLE IF NOT EXISTS agent_ledger (
+  id            SERIAL          PRIMARY KEY,
+  agent_id      UUID            NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  type          VARCHAR(20)     NOT NULL CHECK (type IN ('deposit', 'buy', 'sell', 'settlement_win', 'settlement_loss')),
+  amount        NUMERIC(18, 6)  NOT NULL,
+  balance_after NUMERIC(18, 6)  NOT NULL,
+  reference_id  INTEGER,        -- agent_trades.id for buy/sell; agent_positions.id for settlement
+  created_at    TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_agent_ledger_agent_id  ON agent_ledger(agent_id);
+CREATE INDEX IF NOT EXISTS idx_agent_ledger_created_at ON agent_ledger(created_at DESC);
+
 -- Backfill portfolios for agents registered before this migration
 INSERT INTO agent_portfolios (agent_id)
 SELECT id FROM agents

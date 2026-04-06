@@ -22,3 +22,10 @@ build/
 # TypeScript build info
 tsconfig.tsbuildinfo
 **/tsconfig.tsbuildinfo
+
+# Sync health reports (generated at runtime)
+finmolt-api/sync-health.json
+**/sync-health.json
+
+# PID files
+.pids/
