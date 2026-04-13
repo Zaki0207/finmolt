@@ -233,9 +233,9 @@ async function batchUpsertEvents(client, events) {
     for (let i = 0; i < events.length; i += BATCH_SIZE) {
         const batch = events.slice(i, i + BATCH_SIZE);
         const rows = batch.map(e => {
-            // Issue #5/#6: active=true AND closed=true is contradictory.
-            // Treat closed as authoritative — if closed, force active=false.
-            const active = e.closed ? false : e.active;
+            // active=true AND closed=true is valid for recurring events:
+            // active = "series still running", closed = "this round ended".
+            // Preserve Polymarket's original values without overriding.
             return [
                 e.id,
                 e.slug,
@@ -244,7 +244,7 @@ async function batchUpsertEvents(client, events) {
                 e.image || null,
                 e.icon || null,
                 !!e.negRisk,
-                active,
+                e.active,
                 e.closed,
                 e.startDate || null,
                 e.endDate || null,
@@ -314,8 +314,7 @@ async function batchUpsertMarkets(client, allMarkets) {
             const yesPrice      = extractYesPrice(m);
             const outcomePricesArr = parseOutcomePrices(m);
 
-            // Issue #5/#6: active=true AND closed=true is contradictory.
-            const active = m.closed ? false : m.active;
+            // Preserve Polymarket's active/closed as-is (recurring events use active=true, closed=true legitimately).
 
             // Derive resolved_outcome: prefer outcomePrices collapse over string matching
             let resolvedOutcome = m.resolvedOutcome || null;
@@ -336,7 +335,7 @@ async function batchUpsertMarkets(client, allMarkets) {
                 JSON.stringify(parseOutcomes(m.clobTokenIds)),
                 m.groupItemTitle || null,
                 !!m.negRisk,
-                active,
+                m.active,
                 m.closed,
                 resolvedOutcome,
                 m.startDate || null,
@@ -410,16 +409,14 @@ async function refreshPositionMarkets() {
             try {
                 await client.query('BEGIN');
 
-                const eventActive = event.closed ? false : event.active;
                 await client.query(`
                     UPDATE polymarket_events
                     SET active = $1, closed = $2, fetched_at = NOW()
                     WHERE id = $3
-                `, [eventActive, event.closed, eventId]);
+                `, [event.active, event.closed, eventId]);
 
                 for (const m of (event.markets || [])) {
                     const outcomePricesArr = parseOutcomePrices(m);
-                    const marketActive = m.closed ? false : m.active;
 
                     let resolvedOutcome = m.resolvedOutcome || null;
                     if (!resolvedOutcome && m.closed) {
@@ -449,7 +446,7 @@ async function refreshPositionMarkets() {
                             fetched_at       = NOW()
                         WHERE id = $6
                     `, [
-                        marketActive,
+                        m.active,
                         m.closed,
                         m.closedTime || null,
                         resolvedOutcome,
@@ -459,7 +456,7 @@ async function refreshPositionMarkets() {
                 }
 
                 await client.query('COMMIT');
-                console.log(`  [refresh] Event ${eventId} (${event.title?.substring(0, 50)}): active=${eventActive}, closed=${event.closed}`);
+                console.log(`  [refresh] Event ${eventId} (${event.title?.substring(0, 50)}): active=${event.active}, closed=${event.closed}`);
             } catch (err) {
                 await client.query('ROLLBACK').catch(() => {});
                 console.error(`  [refresh] Event ${eventId} DB update failed:`, err.message);
@@ -740,14 +737,17 @@ async function sync() {
         console.log(`Upserted ${eventTagPairs.length} event-tag associations`);
 
         // Stale event sweep:
-        // Only mark events as inactive if they were absent AND have no open agent positions.
-        // This prevents accidentally deactivating markets that are just beyond the fetch cap.
+        // Only mark events as inactive if they were absent AND currently open (closed=false)
+        // AND have no open agent positions.
+        // Recurring events with active=true AND closed=true are intentionally excluded:
+        // they represent series between rounds and should not be swept to active=false.
         if (activeIds.length > 0) {
             await client.query('BEGIN');
             await client.query(`
                 UPDATE polymarket_events
                 SET active = false, fetched_at = NOW()
                 WHERE active = true
+                  AND closed = false
                   AND id != ALL($1::varchar[])
                   AND id NOT IN (
                       SELECT DISTINCT pm.event_id

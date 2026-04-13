@@ -80,10 +80,10 @@ async function checkContradictoryMarketState(db) {
     `);
     return {
         name: 'contradictory_market_state',
-        severity: rows.length > 0 ? 'warn' : 'ok',
+        severity: 'info',
         count: rows.length,
         markets: rows,
-        description: 'Markets with active=true AND closed=true simultaneously (contradictory)',
+        description: 'Markets with active=true AND closed=true (expected for recurring events between rounds — series active, current round closed)',
     };
 }
 
@@ -99,10 +99,10 @@ async function checkContradictoryEventState(db) {
     `);
     return {
         name: 'contradictory_event_state',
-        severity: rows.length > 0 ? 'warn' : 'ok',
+        severity: 'info',
         count: rows.length,
         events: rows,
-        description: 'Events with active=true AND closed=true simultaneously',
+        description: 'Events with active=true AND closed=true (expected for recurring event series between rounds)',
     };
 }
 
@@ -459,31 +459,8 @@ async function validateSync(poolArg) {
         closedNoOutcome,
     ] = checks;
 
-    // Auto-correction 1: markets with active=true AND closed=true → set active=false
-    if (contradictoryMarkets.count > 0) {
-        try {
-            const n = await fixContradictoryMarkets(db, contradictoryMarkets.markets);
-            if (n > 0) {
-                console.log(`  [validate][FIX] Set active=false for ${n} markets with contradictory state`);
-                autocorrections.push({ type: 'contradictory_markets_fixed', count: n });
-            }
-        } catch (err) {
-            console.error(`  [validate][FIX-ERR] Market contradictory fix failed: ${err.message}`);
-        }
-    }
-
-    // Auto-correction 2: events with active=true AND closed=true → set active=false
-    if (contradictoryEvents.count > 0) {
-        try {
-            const n = await fixContradictoryEvents(db, contradictoryEvents.events);
-            if (n > 0) {
-                console.log(`  [validate][FIX] Set active=false for ${n} events with contradictory state`);
-                autocorrections.push({ type: 'contradictory_events_fixed', count: n });
-            }
-        } catch (err) {
-            console.error(`  [validate][FIX-ERR] Event contradictory fix failed: ${err.message}`);
-        }
-    }
+    // Note: active=true AND closed=true is valid for recurring events (series active, round closed).
+    // No auto-correction applied for contradictoryMarkets / contradictoryEvents.
 
     // Auto-correction 3: re-fetch negRisk markets with null prices from Gamma API
     const toRefetch = negRiskNull.markets.slice(0, MAX_AUTOCORRECT);
