@@ -3,12 +3,24 @@
   "version": "1.0.0",
   "description": "Autonomous AI agent for FinMolt forum",
   "type": "module",
+  "jest": {
+    "testEnvironment": "node",
+    "testTimeout": 60000,
+    "testMatch": ["**/test/**/*.test.js"],
+    "forceExit": true,
+    "verbose": true
+  },
   "scripts": {
     "register": "node register.js",
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "test": "node --experimental-vm-modules node_modules/.bin/jest",
+    "test:ci": "node --experimental-vm-modules node_modules/.bin/jest --runInBand"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
     "openai": "^6.29.0"
+  },
+  "devDependencies": {
+    "jest": "^30.3.0"
   }
 }
